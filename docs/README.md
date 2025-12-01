@@ -24,6 +24,15 @@ Documentation about Venus OS GUI menu system:
 
 **Note:** This PDF suggested dictionary format for SettingsDevice, but Venus OS v3.67 actually uses array format. See `VIKTIGHETNOTE.md` for details.
 
+### Morningstar Tristar MPPT 60 Modbus specification MS-002582_v11.pdf
+Official Morningstar Modbus TCP specification for TriStar MPPT controllers:
+- Complete register map (input registers and coils)
+- Scaling factors and data types
+- Coil addresses for control functions
+- Serial number and device identification
+
+**Used for:** Implementing all Modbus functionality - registers, coils, and control commands.
+
 ---
 
 ## Project Notes

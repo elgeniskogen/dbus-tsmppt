@@ -14,6 +14,7 @@ import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 from time import time
+from datetime import datetime, time as dt_time
 
 # pymodbus v2.x (Venus OS) vs v3.x compatibility
 try:
@@ -26,7 +27,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.0"
+VERSION = "2.1"
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # Modbus register addresses (input registers)
@@ -40,6 +41,7 @@ REG_I_PV = 29          # PV array current
 REG_T_BAT = 37         # Battery temperature
 REG_I_CC_1M = 39       # Charge current (1 min avg)
 REG_CHARGE_STATE = 50  # Charge state
+REG_V_TARGET = 51      # Target regulation voltage
 REG_KWH_TOTAL_RES = 56 # kWh total resettable
 REG_KWH_TOTAL = 57     # kWh total
 REG_POUT = 58          # Output power
@@ -53,6 +55,12 @@ REG_T_FLOAT = 79       # Time in float
 REG_EHW_VERSION = 57549 # Hardware version
 REG_ESERIAL = 57536    # Serial number (4 registers)
 REG_EMODEL = 57548     # Model number
+
+# Modbus coils (read/write)
+COIL_EQUALIZE = 0          # Equalize triggered
+COIL_DISCONNECT = 2        # Charger disconnect
+COIL_RESET_CTRL = 255      # Reset controller (momentary, only when dark!)
+COIL_RESET_COMM = 4351     # Reset comm server (momentary)
 
 # Charge states
 CS_NIGHT = 3
@@ -110,6 +118,9 @@ class TriStarDriver:
         self.t_bulk_ms = 0
         self.last_update = time()
 
+        # Nightly reset tracking
+        self.last_reset_date = None
+
         # D-Bus service
         self.dbus = VeDbusService('com.victronenergy.solarcharger.tristar_0', register=False)
         self._setup_dbus_paths()
@@ -154,6 +165,7 @@ class TriStarDriver:
         s.add_path('/Dc/0/Voltage', None, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Dc/0/Current', None, gettextcallback=lambda p, v: f"{v}A")
         s.add_path('/Dc/0/Temperature', None)
+        s.add_path('/Settings/ChargeTargetVoltage', None, gettextcallback=lambda p, v: f"{v}V")
 
         # Power and state
         s.add_path('/Yield/Power', None, gettextcallback=lambda p, v: f"{v}W")
@@ -174,6 +186,12 @@ class TriStarDriver:
         s.add_path('/Yield/User', None, gettextcallback=lambda p, v: f"{v}kWh")
         s.add_path('/Yield/System', None, gettextcallback=lambda p, v: f"{v}kWh")
 
+        # Control (coils) - writable
+        s.add_path('/Control/EqualizeTriggered', 0, writeable=True, onchangecallback=self._on_coil_write)
+        s.add_path('/Control/ChargerDisconnect', 0, writeable=True, onchangecallback=self._on_coil_write)
+        s.add_path('/Control/ResetController', 0, writeable=True, onchangecallback=self._on_coil_write)
+        s.add_path('/Control/ResetCommServer', 0, writeable=True, onchangecallback=self._on_coil_write)
+
     def _setting_changed(self, setting, old, new):
         """Called when a setting changes in the GUI"""
         logging.info(f"Setting '{setting}' changed from '{old}' to '{new}'")
@@ -185,6 +203,33 @@ class TriStarDriver:
             # Force re-initialization with new settings
             logging.info("Connection settings changed - will re-initialize on next update")
             self.initialized = False
+
+    def _on_coil_write(self, path, value):
+        """Called when a coil control is written via D-Bus"""
+        logging.info(f"Coil write request: {path} = {value}")
+
+        # Map D-Bus path to coil address
+        coil_map = {
+            '/Control/EqualizeTriggered': COIL_EQUALIZE,
+            '/Control/ChargerDisconnect': COIL_DISCONNECT,
+            '/Control/ResetController': COIL_RESET_CTRL,
+            '/Control/ResetCommServer': COIL_RESET_COMM,
+        }
+
+        coil_addr = coil_map.get(path)
+        if coil_addr is None:
+            logging.error(f"Unknown coil path: {path}")
+            return False
+
+        # Write coil
+        success = self.write_coil(coil_addr, bool(value))
+
+        # For momentary buttons, reset to 0 immediately
+        if coil_addr in [COIL_RESET_CTRL, COIL_RESET_COMM]:
+            return 0  # Fire-and-forget
+
+        # For stateful coils, keep the written value
+        return value if success else not value
 
     def read_input_registers(self, address, count):
         """
@@ -253,6 +298,106 @@ class TriStarDriver:
                     return None
 
         return None
+
+    def read_coils(self, address, count):
+        """
+        Read coils with connect → read → close pattern
+        """
+        ip = self.settings['ip_address']
+        port = self.settings['modbus_port']
+        slave_id = self.settings['slave_id']
+
+        for attempt in range(5):
+            client = ModbusTcpClient(host=ip, port=port, timeout=1, retries=0)
+
+            try:
+                if not client.connect():
+                    if attempt < 4:
+                        continue
+                    else:
+                        logging.error(f"Failed to connect for coil read after 5 retries")
+                        return None
+
+                result = client.read_coils(address=address, count=count, unit=slave_id)
+
+                if result.isError():
+                    if attempt < 4:
+                        client.close()
+                        continue
+                    else:
+                        logging.error("Coil read error after 5 retries")
+                        client.close()
+                        return None
+
+                bits = result.bits[:count]
+                client.close()
+                return bits
+
+            except Exception as e:
+                if attempt < 4:
+                    logging.warning(f"Coil read exception, retry {attempt + 1}/5: {e}")
+                else:
+                    logging.error(f"Coil read exception after 5 retries: {e}")
+
+                try:
+                    client.close()
+                except:
+                    pass
+
+                if attempt == 4:
+                    return None
+
+        return None
+
+    def write_coil(self, address, value):
+        """
+        Write single coil with connect → write → close pattern
+        """
+        ip = self.settings['ip_address']
+        port = self.settings['modbus_port']
+        slave_id = self.settings['slave_id']
+
+        for attempt in range(5):
+            client = ModbusTcpClient(host=ip, port=port, timeout=1, retries=0)
+
+            try:
+                if not client.connect():
+                    if attempt < 4:
+                        continue
+                    else:
+                        logging.error(f"Failed to connect for coil write after 5 retries")
+                        return False
+
+                result = client.write_coil(address=address, value=value, unit=slave_id)
+
+                if result.isError():
+                    if attempt < 4:
+                        client.close()
+                        continue
+                    else:
+                        logging.error(f"Coil write error after 5 retries")
+                        client.close()
+                        return False
+
+                client.close()
+                logging.info(f"Successfully wrote coil {address} = {value}")
+                return True
+
+            except Exception as e:
+                if attempt < 4:
+                    logging.warning(f"Coil write exception, retry {attempt + 1}/5: {e}")
+                else:
+                    logging.error(f"Coil write exception after 5 retries: {e}")
+
+                try:
+                    client.close()
+                except:
+                    pass
+
+                if attempt == 4:
+                    return False
+
+        return False
 
     def initialize(self):
         """Read static device information"""
@@ -357,6 +502,7 @@ class TriStarDriver:
             v_pv = reg(REG_V_PV) * self.v_pu / 32768.0
             i_pv = reg(REG_I_PV) * self.i_pu / 32768.0
             p_out = reg(REG_POUT) * self.i_pu * self.v_pu / 131072.0
+            v_target = reg(REG_V_TARGET) * self.v_pu / 32768.0
 
             # Charge state
             cs_raw = reg(REG_CHARGE_STATE)
@@ -374,6 +520,7 @@ class TriStarDriver:
             self.dbus['/Dc/0/Voltage'] = round(v_bat, 2)
             self.dbus['/Dc/0/Current'] = round(i_cc, 2)
             self.dbus['/Dc/0/Temperature'] = round(self._to_signed(reg(REG_T_BAT)), 1)
+            self.dbus['/Settings/ChargeTargetVoltage'] = round(v_target, 2)
             self.dbus['/Yield/Power'] = round(p_out, 0)
             self.dbus['/State'] = cs
 
@@ -400,10 +547,38 @@ class TriStarDriver:
             self.dbus['/Yield/User'] = round(reg(REG_KWH_TOTAL_RES) + daily_kwh, 0)
             self.dbus['/Yield/System'] = round(reg(REG_KWH_TOTAL) + daily_kwh, 0)
 
+            # Read stateful coils
+            coils = self.read_coils(COIL_EQUALIZE, 3)  # Read coils 0, 1, 2
+            if coils is not None:
+                self.dbus['/Control/EqualizeTriggered'] = int(coils[0])
+                self.dbus['/Control/ChargerDisconnect'] = int(coils[2])
+
+            # Nightly reset at 03:00
+            self._check_nightly_reset()
+
         except Exception as e:
             logging.error(f"Update error: {e}", exc_info=True)
 
         return True  # Continue timer
+
+    def _check_nightly_reset(self):
+        """Check if we should perform nightly comm server reset at 03:00"""
+        now = datetime.now()
+        current_date = now.date()
+        current_hour = now.hour
+        current_minute = now.minute
+
+        # Check if it's 03:00-03:04 (5-minute window to catch it)
+        if current_hour == 3 and current_minute < 5:
+            # Only reset once per day
+            if self.last_reset_date != current_date:
+                logging.info("Performing nightly comm server reset at 03:00")
+                success = self.write_coil(COIL_RESET_COMM, True)
+                if success:
+                    self.last_reset_date = current_date
+                    logging.info("Nightly reset completed successfully")
+                else:
+                    logging.error("Nightly reset failed")
 
     @staticmethod
     def _to_signed(value):

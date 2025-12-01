@@ -74,14 +74,26 @@ Your TriStar MPPT will appear as a **Solar Charger** in:
 
 ## Features
 
+### Monitoring
 - ✅ Full Modbus TCP communication (connect-read-close pattern)
 - ✅ All TriStar registers: voltage, current, power, yield, temperature
+- ✅ Target regulation voltage (charge setpoint)
 - ✅ Daily history: kWh, max values, time in absorption/bulk/float
 - ✅ Total yield tracking
+- ✅ Full VRM Portal integration
+
+### Control
+- ✅ Equalize trigger (read/write coil)
+- ✅ Charger disconnect (read/write coil)
+- ✅ Controller reset (momentary button)
+- ✅ Comm server reset (momentary button)
+- ✅ **Automatic nightly reset at 03:00** (comm server)
+
+### Reliability
 - ✅ Automatic reconnection on network loss
 - ✅ Settings change callback (auto-reconnect when IP/port changes)
 - ✅ WAN-optimized: 1-second timeout with 5 retries
-- ✅ Full VRM Portal integration
+- ✅ MQTT integration via Venus OS broker
 
 ---
 
@@ -165,6 +177,54 @@ tail -f /var/log/dbus-tristar/current
 - Proper signed/unsigned conversion and scaling
 
 **See [docs/TECHNICAL-DETAILS.md](docs/TECHNICAL-DETAILS.md) for complete technical details and C++ compatibility analysis.**
+
+---
+
+## Home Assistant Integration
+
+Venus OS has a built-in MQTT broker that automatically publishes all D-Bus paths. This makes integration with Home Assistant simple and native.
+
+### Control via MQTT
+
+**Read coil status:**
+```
+N/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered
+N/<portal-id>/solarcharger/tristar_0/Control/ChargerDisconnect
+```
+
+**Write to coils:**
+```
+W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered {"value": 1}
+W/<portal-id>/solarcharger/tristar_0/Control/ResetController {"value": 1}
+```
+
+### Example HA Configuration
+
+```yaml
+mqtt:
+  switch:
+    - unique_id: tristar_equalize
+      name: "TriStar Equalize Charge"
+      state_topic: "N/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered"
+      command_topic: "W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered"
+      payload_on: '{"value": 1}'
+      payload_off: '{"value": 0}'
+
+    - unique_id: tristar_disconnect
+      name: "TriStar Charger Disconnect"
+      state_topic: "N/<portal-id>/solarcharger/tristar_0/Control/ChargerDisconnect"
+      command_topic: "W/<portal-id>/solarcharger/tristar_0/Control/ChargerDisconnect"
+      payload_on: '{"value": 1}'
+      payload_off: '{"value": 0}'
+
+  button:
+    - unique_id: tristar_reset_controller
+      name: "TriStar Reset Controller"
+      command_topic: "W/<portal-id>/solarcharger/tristar_0/Control/ResetController"
+      payload_press: '{"value": 1}'
+```
+
+**Note:** Replace `<portal-id>` with your Venus OS VRM Portal ID (found in Settings → VRM Portal).
 
 ---
 

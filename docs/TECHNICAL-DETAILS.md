@@ -231,7 +231,8 @@ All calculations match **exactly**:
 - Yield calculations: `daily_kwh + total_kwh` (same algorithm)
 
 #### D-Bus Paths
-**All 27 D-Bus paths are identical:**
+
+**Core Paths (27 - identical to C++ driver):**
 - `/Pv/V`, `/Pv/I` - PV array voltage/current
 - `/Dc/0/Voltage`, `/Dc/0/Current`, `/Dc/0/Temperature` - Battery data
 - `/Yield/Power`, `/State`, `/Connected`, `/Mode` - Status
@@ -239,6 +240,13 @@ All calculations match **exactly**:
 - `/Yield/User`, `/Yield/System` - Total yield
 - `/ProductName`, `/Serial`, `/FirmwareVersion`, `/HardwareVersion` - Device info
 - `/ProductId`, `/DeviceInstance`, `/ErrorCode` - Management
+
+**New in v2.1 (Python driver only):**
+- `/Settings/ChargeTargetVoltage` - Target regulation voltage (read-only)
+- `/Control/EqualizeTriggered` - Equalize charge trigger (read/write coil 0)
+- `/Control/ChargerDisconnect` - Disconnect charger (read/write coil 2)
+- `/Control/ResetController` - Reset controller (write-only coil 255, momentary)
+- `/Control/ResetCommServer` - Reset comm server (write-only coil 4351, momentary)
 
 #### Charge State Mapping
 All 10 TriStar states map to Victron states **identically**:
@@ -251,6 +259,96 @@ All 10 TriStar states map to Victron states **identically**:
 - SLAVE → 11 (OTHER)
 
 **Result:** Venus OS GUI, VRM Portal, and all integrations see **exactly the same data** from both drivers.
+
+---
+
+## 🆕 New Features in v2.1
+
+### Target Regulation Voltage Sensor
+
+**Register:** 51 (REG_V_TARGET)
+**D-Bus path:** `/Settings/ChargeTargetVoltage`
+**Scaling:** `reg * v_pu / 32768.0`
+**Type:** Read-only voltage sensor
+
+Shows the target voltage the TriStar is currently regulating to (absorption, float, or equalize voltage depending on charge state).
+
+**Usage:**
+```bash
+dbus -y com.victronenergy.solarcharger.tristar_0 /Settings/ChargeTargetVoltage GetValue
+```
+
+### Modbus Coil Control
+
+Four new control paths allow read/write access to TriStar coils:
+
+| D-Bus Path | Coil | Type | Description |
+|------------|------|------|-------------|
+| `/Control/EqualizeTriggered` | 0 | Read/Write | Trigger equalize charge cycle |
+| `/Control/ChargerDisconnect` | 2 | Read/Write | Disconnect/reconnect charger |
+| `/Control/ResetController` | 255 | Write-only | Reset controller (momentary, only when dark!) |
+| `/Control/ResetCommServer` | 4351 | Write-only | Reset Modbus comm server (momentary) |
+
+**Stateful coils** (0, 2):
+- Read current state every 5 seconds
+- State persists until changed
+- Value updates in D-Bus reflect TriStar's actual state
+
+**Momentary buttons** (255, 4351):
+- Write 1 to trigger action
+- D-Bus value always shows 0
+- Fire-and-forget (no state tracking)
+
+**Usage examples:**
+```bash
+# Read equalize status
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/EqualizeTriggered GetValue
+
+# Trigger equalize
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/EqualizeTriggered SetValue 1
+
+# Disconnect charger
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ChargerDisconnect SetValue 1
+
+# Reset comm server
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ResetCommServer SetValue 1
+```
+
+### Automatic Nightly Reset
+
+The driver automatically performs a **comm server reset** every night at **03:00**.
+
+**Implementation:**
+- Checks time every poll cycle (5 seconds)
+- 5-minute window (03:00-03:04) to ensure it triggers
+- Executes only once per day
+- Logged: `Performing nightly comm server reset at 03:00`
+
+**Why:** TriStar Modbus comm server requires periodic reset to maintain stability. Previously done manually via Home Assistant, now handled automatically by the driver.
+
+**Disable:** Not currently configurable. Edit `_check_nightly_reset()` in `dbus_tristar.py` if you want to disable or change the schedule.
+
+### MQTT Integration
+
+All D-Bus paths are automatically published to Venus OS MQTT broker:
+
+**Topics:**
+```
+N/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered      # Read
+W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered      # Write
+```
+
+**Home Assistant example:**
+```yaml
+mqtt:
+  switch:
+    - unique_id: tristar_equalize
+      name: "TriStar Equalize"
+      state_topic: "N/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered"
+      command_topic: "W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered"
+      payload_on: '{"value": 1}'
+      payload_off: '{"value": 0}'
+```
 
 ---
 
