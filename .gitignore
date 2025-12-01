@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Qt/C++ build artifacts (legacy)
+software/*.o
+software/*.a
+software/moc_*
+software/Makefile
+software/dbus-tsmppt
+software/.qmake.stash
+
+# QML backups
+*.qml.backup
+qml/*.backup
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Venus OS test files
+test_settings.xml

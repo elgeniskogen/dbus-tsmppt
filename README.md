@@ -1,51 +1,203 @@
-dbus-tsmppt
-===========
+# TriStar MPPT Driver for Venus OS
 
-This application reads essential charging data from a Morningstar Tristar MPPT charge controller and publish it on the D-Bus. It is designed to run on the [Victron Energy Venus OS](https://github.com/victronenergy/venus) but can easily be modified to run on other systems.
+**Modern Python driver for Morningstar TriStar MPPT solar charge controllers**
 
-Building
-========
+✅ **Production-ready** - Tested on Venus OS v3.67
+✅ **Zero compilation** - Pure Python, just copy and run
+✅ **No QML required** - Configure via D-Bus command line
+✅ **100% compatible** - Same data as original C++ driver
+✅ **WAN-ready** - Works over internet with optimized timeouts
 
-In order to build the application for the CCGX you need a linux system, a recent version of the QT libraries and the CCGX SDK. You can find instructions on installing the CCGX SDK here:
+---
 
-https://github.com/victronenergy/venus/wiki/howto-install-and-use-the-sdk
+## Quick Start
 
-You will also need libmodbus v3.1.2 or higher (http://libmodbus.org/).
+```bash
+# 1. Copy files to Venus OS
+scp dbus_tristar.py install.sh root@<venus-ip>:/tmp/
 
-Clone repo with `git clone --recursive https://github.com/osaether/dbus-tsmppt.git`
+# 2. SSH to Venus OS
+ssh root@<venus-ip>
 
-    cd software
-    qmake LIBS+=-L/usr/local/lib/ INCLUDEPATH+=/usr/local/include/modbus
-    make
+# 3. Install (creates service and starts driver)
+cd /tmp
+chmod +x install.sh
+./install.sh
+```
 
-Change LIBS and INCLUDEPATH above according to your installation.
+**That's it!** The driver is now running as a service.
 
-Running the application on CCGX
-===============================
+---
 
-The application expect the IP-address/hostname and the Modbus IP-port number stored in the CCGX settings. You can either edit the /data/conf/settings.xml file manually (not recommended) or use the CCGX settings menu. To use the settings menu copy the file PageSettingsTsmppt.qml in the qml folder to the folder on CCGX where the qml files are stored (usually /opt/color-control/gui/qml). Then add a link to PageSettingsTsmppt.qml in the main settings qml-file, PageSettings.qml found in the same folder:
+## Configuration
 
-    MbSubMenu {
-        description: qsTr("TriStar MPPT 60 Solar Charger")
-        subpage: Component { PageSettingsTsmppt {} }
-    }
+Settings are configured via D-Bus command line (no GUI menu in Venus OS v3.67):
 
-Change "TriStar MPPT 60" to "TriStar MPPT 45" or "TriStar MPPT 30" according to the Tristar MPPT version you have.
+```bash
+# Set IP address (REQUIRED)
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/IPAddress SetValue "192.168.1.100"
 
-To display the data in the CCGX gui you also need to add these lines to the isModelSupported function in PageSolarCharger.qml:
+# Optional settings (with defaults shown)
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/PortNumber SetValue 502
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/Interval SetValue 5000
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/SlaveID SetValue 1
 
-    /* Morningstar TriStar MPPT */
-    if (productId.value === 0xABCD)
-        return true
+# Restart driver to apply changes
+svc -t /service/dbus-tristar
+```
 
-Testing on Linux
-================
+---
 
-To compile and run on linux you will need the QT SDK (version 4.8.x), including QT D-Bus support. Because you do not have access to the system D-Bus (unless you run as root or adjust the D-Bus configuration) you should start the application with: 'dbus-tsmppt --dbus session'. Note that QT for windows does not support D-Bus, so you cannot build a windows executable.
+## Verification
 
-The dbus-tsmppt executable expects the CCGX settings manager (localsettings) to be running. localsettings is available on github:
+```bash
+# Check service is running
+svstat /service/dbus-tristar
 
-https://github.com/victronenergy/localsettings
+# Check logs
+tail -f /var/log/dbus-tristar/current
 
-The README.md of localsettings contains some information on how to run localsettings on linux.
+# Check D-Bus registration
+dbus -y com.victronenergy.solarcharger.tristar_0 /ProductName GetValue
 
+# Check current values
+dbus -y com.victronenergy.solarcharger.tristar_0 /Dc/0/Voltage GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Yield/Power GetValue
+```
+
+Your TriStar MPPT will appear as a **Solar Charger** in:
+- Venus OS main screen
+- VRM Portal dashboard
+- Remote Console
+
+---
+
+## Features
+
+- ✅ Full Modbus TCP communication (connect-read-close pattern)
+- ✅ All TriStar registers: voltage, current, power, yield, temperature
+- ✅ Daily history: kWh, max values, time in absorption/bulk/float
+- ✅ Total yield tracking
+- ✅ Automatic reconnection on network loss
+- ✅ Settings change callback (auto-reconnect when IP/port changes)
+- ✅ WAN-optimized: 1-second timeout with 5 retries
+- ✅ Full VRM Portal integration
+
+---
+
+## Supported Hardware
+
+- Morningstar TriStar MPPT 30
+- Morningstar TriStar MPPT 45
+- Morningstar TriStar MPPT 60
+
+**Requirements:**
+- TriStar with Modbus TCP enabled
+- Network connectivity between Venus OS and TriStar
+- Venus OS v3.4+ (tested on v3.67)
+
+---
+
+## Files
+
+```
+dbus-tsmppt/
+├── dbus_tristar.py              # Main driver
+├── install.sh                   # Installation script
+├── README.md                    # This file (main documentation)
+├── QUICKSTART.md                # Quick start guide
+├── test_connection.py           # Connection testing tool
+├── dbus_tristar_mock.py         # Mock driver for testing
+├── docs/                        # Technical docs and PDFs
+└── Reference Cplusplus code for dbus_tsmppt/   # Legacy C++/QML code
+```
+
+---
+
+## Documentation
+
+- **[QUICKSTART.md](QUICKSTART.md)** - 3-minute installation guide
+- **[test_connection.py](test_connection.py)** - Test Modbus connection to your TriStar
+- **[docs/TECHNICAL-DETAILS.md](docs/TECHNICAL-DETAILS.md)** - Complete technical details and C++ compatibility analysis
+
+---
+
+## Troubleshooting
+
+**Can't connect to TriStar?**
+```bash
+# Test connection
+python3 test_connection.py <tristar-ip> 502 1
+
+# Check network
+ping <tristar-ip>
+
+# Review logs
+tail -f /var/log/dbus-tristar/current
+```
+
+**No data showing?**
+- Verify IP address is correct in settings
+- Check TriStar has Modbus TCP enabled (usually port 502)
+- Check slave ID matches your device (usually 1)
+- Review logs for connection errors
+
+**Settings menu doesn't appear in GUI?**
+- **Expected behavior** in Venus OS v3.67
+- Use D-Bus command line instead (see Configuration section)
+- Settings are fully functional via D-Bus
+
+---
+
+## Technical Details
+
+**Architecture:**
+- Uses Venus OS `SettingsDevice` API (array format for v3.67)
+- Connect-read-close Modbus pattern (matches original C++ driver)
+- pymodbus v3.x compatible (`unit=` parameter)
+- GLib main loop with periodic timer
+- Full error handling with automatic retries
+
+**D-Bus Service:**
+- Service name: `com.victronenergy.solarcharger.tristar_0`
+- All 27 D-Bus paths identical to original C++ driver
+- Charge state mapping: TriStar states → Victron states
+- Proper signed/unsigned conversion and scaling
+
+**See [docs/TECHNICAL-DETAILS.md](docs/TECHNICAL-DETAILS.md) for complete technical details and C++ compatibility analysis.**
+
+---
+
+## Legacy Code
+
+The original C++ driver and legacy Python versions are preserved in:
+
+**[Reference Cplusplus code for dbus_tsmppt/](Reference%20Cplusplus%20code%20for%20dbus_tsmppt/)**
+
+Contents:
+- `software/` - Original Qt/C++ driver (Venus OS v2.30 and older)
+- `qml/` - QML files for Venus OS v2.80-v3.3
+- `dbus-tsmppt.py` - Legacy Python driver
+- Old installation scripts and documentation
+
+These are kept for reference only. **Use `dbus_tristar.py` for all new installations.**
+
+---
+
+## License
+
+MIT License - See [LICENSE](LICENSE)
+
+---
+
+## Credits
+
+- **Original C++ driver:** Ole André Sæther (2018-2019)
+- **Python rewrite:** 2024 - Modern Venus OS v3.4+ compatible
+- **Architecture:** Based on Victron Energy Venus OS and velib_python
+
+---
+
+**Enjoy your TriStar MPPT on Venus OS! ☀️🔋**
+
+Questions? Check the logs: `tail -f /var/log/dbus-tristar/current`
