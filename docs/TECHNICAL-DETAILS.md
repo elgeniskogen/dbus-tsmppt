@@ -217,6 +217,24 @@ The Python driver is **100% functionally identical** to the original Qt/C++ driv
 | **Timeout** | 20 seconds | 1 second (WAN-optimized) | ⚠️ Improved |
 | **Retries** | 5 attempts | 5 attempts | ✅ Identical |
 
+**Important - TriStar TCP Behavior:**
+
+From TriStar MPPT Modbus specification (MS-002582_v11):
+> "Note: the TCP socket is closed by the TS-MPPT after each MODBUS response (change pending)"
+
+**What this means:**
+- ✅ TriStar **automatically closes** the TCP socket after every Modbus response
+- ✅ Persistent connections are **not supported** by TriStar hardware
+- ✅ Connect-read-close pattern is **required**, not optional
+- ✅ Each Modbus operation requires its own TCP connection
+
+**Driver implementation:**
+The driver performs **2 separate TCP connections** per poll cycle (every 5 seconds):
+1. Connect → Read input registers (24-79, 56 registers) → Close
+2. Connect → Read coils (0-2, 3 coils) → Close
+
+This matches TriStar's documented behavior and cannot be optimized further without TriStar firmware changes. The overhead (~400-1000ms per poll over WAN) is unavoidable due to hardware limitations.
+
 #### Data Conversion & Scaling
 All calculations match **exactly**:
 - Battery Voltage: `reg * v_pu / 32768.0`
