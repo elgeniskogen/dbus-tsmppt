@@ -8,6 +8,10 @@
 ✅ **100% compatible** - Same data as original C++ driver
 ✅ **WAN-ready** - Works over internet with optimized timeouts
 
+TO DO:
+* Make a path with the Tristar charger states, both number and text
+* Check modbus parameters to be used for I and V. Now it is a mix of fast and slow. 
+* Make filters similar to those in the templates in HS
 ---
 
 ## Quick Start
