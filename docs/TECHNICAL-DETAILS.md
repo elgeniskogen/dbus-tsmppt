@@ -155,6 +155,7 @@ supportedSettings={
     'modbus_port': ['/Settings/TristarMPPT/PortNumber', 502, 1, 65535],
     'poll_interval': ['/Settings/TristarMPPT/Interval', 5000, 1000, 60000],
     'slave_id': ['/Settings/TristarMPPT/SlaveID', 1, 1, 247],
+    'device_instance': ['/Settings/TristarMPPT/DeviceInstance', 0, 0, 255],
 }
 # Format: [D-Bus path, default, min, max]
 ```
@@ -261,10 +262,15 @@ All calculations match **exactly**:
 
 **New in v2.1 (Python driver only):**
 - `/Settings/ChargeTargetVoltage` - Target regulation voltage (read-only)
-- `/Control/EqualizeTriggered` - Equalize charge trigger (read/write coil 0)
-- `/Control/ChargerDisconnect` - Disconnect charger (read/write coil 2)
+- `/Control/EqualizeTriggered` - Equalize charge trigger (read/write coil 0, verified)
+- `/Control/ChargerDisconnect` - Disconnect charger (read/write coil 2, verified)
 - `/Control/ResetController` - Reset controller (write-only coil 255, momentary)
 - `/Control/ResetCommServer` - Reset comm server (write-only coil 4351, momentary)
+- `/Custom/Stats/SuccessfulReads` - Total successful Modbus reads (diagnostic)
+- `/Custom/Stats/FailedReads` - Total failed Modbus reads (diagnostic)
+- `/Custom/Stats/ConsecutiveFailures` - Current consecutive failure count (diagnostic)
+- `/Custom/Stats/LastSuccessTime` - Unix timestamp of last successful read (diagnostic)
+- `/Custom/Stats/BackoffFactor` - Current poll interval multiplier: 1, 2, or 4 (diagnostic)
 
 #### Charge State Mapping
 All 10 TriStar states map to Victron states **identically**:
@@ -367,6 +373,198 @@ mqtt:
       payload_on: '{"value": 1}'
       payload_off: '{"value": 0}'
 ```
+
+---
+
+## 🌐 WAN Optimizations (v2.1+)
+
+The driver is optimized for operation over WAN connections (VPN, cellular, internet). These features were added based on real-world deployment experience with remote sites.
+
+### Connection Watchdog
+
+**Purpose:** Detect when TriStar becomes unreachable and mark device as disconnected.
+
+**Implementation:**
+- Tracks timestamp of last successful Modbus read
+- If no successful reads for 3 minutes (180 seconds), sets `/Connected = 0`
+- Prevents stale data from being displayed in GUI
+- Automatically recovers when connection restored
+
+**Observable:** Check `/Custom/Stats/LastSuccessTime` to see when last successful read occurred.
+
+### Exponential Backoff
+
+**Purpose:** Reduce network traffic and CPU load during extended outages.
+
+**Behavior:**
+- Normal operation: 5-second poll interval (1x)
+- After 10 consecutive failures (~50 seconds): backs off to 10 seconds (2x)
+- After 20 consecutive failures: backs off to 20 seconds (4x, maximum)
+- Immediately returns to 5 seconds when connection recovers
+
+**Example timeline:**
+```
+00:00 - Normal polling at 5s interval
+00:50 - 10 failures → backoff to 10s interval
+01:40 - 20 failures → backoff to 20s interval (max)
+...network down for hours...
+10:30 - Connection restored → immediately return to 5s interval
+```
+
+**Observable:** Check `/Custom/Stats/BackoffFactor` (1, 2, or 4).
+
+**Benefit:** Over a 60-minute outage, reduces Modbus attempts from ~720 to ~100 (85% reduction).
+
+### Data Validation (Sanity Checks)
+
+**Purpose:** Reject corrupted Modbus packets that pass CRC but contain unrealistic values.
+
+**Implementation:**
+```python
+# Battery voltage: 18-35V (LiFePO4 7S nominal 21-29.4V with margin)
+if not (18.0 <= v_bat <= 35.0):
+    logging.warning("Unrealistic battery voltage")
+    return  # Skip update, keep old values
+
+# Similar checks for PV voltage (0-160V), charge current (0-70A), power (0-2500W)
+```
+
+**Why needed:** Over WAN, bit-flips can occur at higher protocol layers. Modbus CRC validates packet structure but not semantic correctness. A corrupted register value like `0xFFFF` (65535) would pass CRC but translate to impossible voltage (65.5V).
+
+**Observable:** Check logs for "Unrealistic" warnings.
+
+### Critical Coil Verification
+
+**Purpose:** Ensure safety-critical operations (EQUALIZE, DISCONNECT) actually succeeded.
+
+**Implementation:**
+1. Write coil via Modbus
+2. Wait 100ms for TriStar to process
+3. Read coil back
+4. Compare written value with readback
+5. Log error if mismatch
+
+**Example:**
+```python
+# Write equalize coil
+write_coil(COIL_EQUALIZE, True)
+
+# Verify (after 100ms)
+verify = read_coils(COIL_EQUALIZE, 1)
+if verify[0] != True:
+    logging.error("Coil write verification failed")
+    return False  # Propagate failure
+```
+
+**Why needed:** Over WAN, ACK can succeed but TriStar may reject command due to internal state (e.g., refusing EQUALIZE if battery voltage too low).
+
+**Observable:** Check logs for "Coil write verification" messages.
+
+### Smart Retry Logging
+
+**Purpose:** Reduce log noise during transient network issues.
+
+**Behavior:**
+- First 4 retry attempts: logged at DEBUG level (not shown in INFO logs)
+- Final (5th) attempt failure: logged at ERROR level
+- Result: Only persistent failures appear in standard logs
+
+**Example:**
+```
+# Transient failure (connection hiccup, packet loss):
+# No log entries (retries at DEBUG level)
+
+# Persistent failure (network down):
+2024-01-24 10:30:15 ERROR    Failed to connect after 5 retries
+```
+
+**Benefit:** Logs remain clean and actionable. Transient hiccups don't trigger false alarms.
+
+### Graceful Shutdown
+
+**Purpose:** Proper cleanup when Venus OS restarts or service stops.
+
+**Implementation:**
+- Handles SIGTERM (service stop, reboot)
+- Handles SIGINT (Ctrl+C during testing)
+- Cleanly exits GLib main loop
+- Prevents zombie processes
+
+**Observable:** Check logs during `svc -t /service/dbus-tristar`:
+```
+2024-01-24 10:30:15 INFO     Received signal SIGTERM - shutting down gracefully...
+```
+
+### Statistics for Remote Diagnostics
+
+**Purpose:** Enable debugging without SSH access to Venus OS.
+
+**Available metrics:**
+```bash
+# Total operations
+/Custom/Stats/SuccessfulReads    # Cumulative successful reads
+/Custom/Stats/FailedReads        # Cumulative failed reads
+
+# Current health
+/Custom/Stats/ConsecutiveFailures  # 0 = healthy, >0 = problems
+/Custom/Stats/LastSuccessTime      # Unix timestamp
+/Custom/Stats/BackoffFactor        # 1 = normal, 2-4 = degraded
+
+# Check from VRM Portal or via dbus-spy
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Stats/ConsecutiveFailures GetValue
+```
+
+**Example diagnosis from VRM Portal:**
+```
+SuccessfulReads: 14523
+FailedReads: 47
+ConsecutiveFailures: 0
+LastSuccessTime: 1738012345 (6 minutes ago)
+BackoffFactor: 1
+
+→ Conclusion: 99.7% success rate, currently healthy
+```
+
+**Versus during outage:**
+```
+SuccessfulReads: 14523
+FailedReads: 94
+ConsecutiveFailures: 47
+LastSuccessTime: 1738009000 (56 minutes ago)
+BackoffFactor: 4
+
+→ Conclusion: Network down for 56 minutes, driver in backoff mode
+```
+
+### Dynamic Timer Restart
+
+**Purpose:** Apply new poll interval immediately when changed via settings.
+
+**Behavior:**
+- Changing `/Settings/TristarMPPT/Interval` immediately stops old timer
+- Starts new timer with new interval
+- No service restart required
+
+**Before (v2.0):** Had to restart service to apply interval change.
+
+**After (v2.1):** Change takes effect within current poll cycle (max 5 seconds).
+
+### Configurable Device Instance
+
+**Purpose:** Support multiple TriStar MPPTs on same Venus OS installation.
+
+**Implementation:**
+```bash
+# First TriStar (north array)
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/DeviceInstance SetValue 0
+# Service: com.victronenergy.solarcharger.tristar_0
+
+# Second TriStar (south array)
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/DeviceInstance SetValue 1
+# Service: com.victronenergy.solarcharger.tristar_1
+```
+
+**Note:** Each instance requires separate installation (different service directories).
 
 ---
 
