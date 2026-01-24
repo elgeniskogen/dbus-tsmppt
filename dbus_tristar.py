@@ -10,10 +10,11 @@ Configure via: dbus -y com.victronenergy.settings /Settings/TristarMPPT/...
 
 import logging
 import sys
+import signal
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
-from time import time
+from time import time, sleep
 from datetime import datetime, time as dt_time
 
 # pymodbus v2.x (Venus OS) vs v3.x compatibility
@@ -27,7 +28,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.1"
+VERSION = "2.2"  # WAN-optimized with watchdog, backoff, validation, and diagnostics
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # Modbus register addresses (input registers)
@@ -97,6 +98,7 @@ class TriStarDriver:
                 'modbus_port': ['/Settings/TristarMPPT/PortNumber', 502, 1, 65535],
                 'poll_interval': ['/Settings/TristarMPPT/Interval', 5000, 1000, 60000],
                 'slave_id': ['/Settings/TristarMPPT/SlaveID', 1, 1, 247],
+                'device_instance': ['/Settings/TristarMPPT/DeviceInstance', 0, 0, 255],
             },
             eventCallback=self._setting_changed
         )
@@ -118,21 +120,33 @@ class TriStarDriver:
         self.t_bulk_ms = 0
         self.last_update = time()
 
+        # Connection watchdog (track last successful read)
+        self.last_successful_read = time()
+        self.watchdog_timeout = 180  # 3 minutes - mark as disconnected if no successful reads
+
+        # Statistics for diagnostics
+        self.successful_reads = 0
+        self.failed_reads = 0
+        self.consecutive_failures = 0
+
+        # Exponential backoff on persistent failures
+        self.backoff_factor = 1  # Multiplier for poll interval (1x, 2x, 4x)
+
         # Nightly reset tracking
         self.last_reset_date = None
 
-        # D-Bus service
-        self.dbus = VeDbusService('com.victronenergy.solarcharger.tristar_0', register=False)
+        # Timer management
+        self.timer_id = None
+
+        # D-Bus service (use configurable device instance)
+        instance = int(self.settings['device_instance'])
+        service_name = f'com.victronenergy.solarcharger.tristar_{instance}'
+        self.dbus = VeDbusService(service_name, register=False)
         self._setup_dbus_paths()
         self.dbus.register()
 
         # Start periodic updates
-        # Convert milliseconds to seconds
-        poll_interval_ms = int(self.settings['poll_interval'])
-        poll_interval_sec = poll_interval_ms // 1000
-        logging.info(f"Starting timer with interval: {poll_interval_sec} seconds ({poll_interval_ms}ms)")
-        timer_id = GLib.timeout_add_seconds(poll_interval_sec, self.update)
-        logging.info(f"Timer registered with ID: {timer_id}")
+        self._start_timer()
 
         logging.info("TriStar MPPT driver initialized")
         logging.info(f"Settings: {self.settings['ip_address']}:{self.settings['modbus_port']}")
@@ -192,13 +206,40 @@ class TriStarDriver:
         s.add_path('/Control/ResetController', 0, writeable=True, onchangecallback=self._on_coil_write)
         s.add_path('/Control/ResetCommServer', 0, writeable=True, onchangecallback=self._on_coil_write)
 
+        # Statistics for diagnostics and health monitoring
+        s.add_path('/Custom/Stats/SuccessfulReads', 0, writeable=False)
+        s.add_path('/Custom/Stats/FailedReads', 0, writeable=False)
+        s.add_path('/Custom/Stats/ConsecutiveFailures', 0, writeable=False)
+        s.add_path('/Custom/Stats/LastSuccessTime', 0, writeable=False)  # Unix timestamp
+        s.add_path('/Custom/Stats/BackoffFactor', 1, writeable=False)  # Poll interval multiplier
+
+    def _start_timer(self):
+        """Start or restart the periodic update timer (with exponential backoff support)"""
+        # Stop existing timer if running
+        if self.timer_id is not None:
+            GLib.source_remove(self.timer_id)
+            logging.debug(f"Removed previous timer (ID: {self.timer_id})")
+
+        # Convert milliseconds to seconds and apply backoff
+        poll_interval_ms = int(self.settings['poll_interval']) * self.backoff_factor
+        poll_interval_sec = int(poll_interval_ms // 1000)
+
+        # Start new timer
+        self.timer_id = GLib.timeout_add_seconds(poll_interval_sec, self.update)
+
+        if self.backoff_factor > 1:
+            logging.info(f"Timer started with backoff: {poll_interval_sec}s ({self.backoff_factor}x base interval), ID: {self.timer_id}")
+        else:
+            logging.info(f"Timer started with interval: {poll_interval_sec} seconds ({int(self.settings['poll_interval'])}ms), ID: {self.timer_id}")
+
     def _setting_changed(self, setting, old, new):
         """Called when a setting changes in the GUI"""
         logging.info(f"Setting '{setting}' changed from '{old}' to '{new}'")
 
         if setting == 'poll_interval':
             # Restart timer with new interval
-            logging.info("Poll interval changed - will take effect on next update")
+            logging.info("Restarting timer with new poll interval")
+            self._start_timer()
         elif setting in ['ip_address', 'modbus_port', 'slave_id']:
             # Force re-initialization with new settings
             logging.info("Connection settings changed - will re-initialize on next update")
@@ -254,7 +295,7 @@ class TriStarDriver:
                 # Connect
                 if not client.connect():
                     if attempt < 4:
-                        logging.warning(f"Connection failed, retry {attempt + 1}/5")
+                        logging.debug(f"Connection failed, retry {attempt + 1}/5")
                         continue
                     else:
                         logging.error(f"Failed to connect to {ip}:{port} after 5 retries")
@@ -270,7 +311,7 @@ class TriStarDriver:
                 # Check result
                 if result.isError():
                     if attempt < 4:
-                        logging.warning(f"Modbus error, retry {attempt + 1}/5")
+                        logging.debug(f"Modbus error, retry {attempt + 1}/5")
                         client.close()
                         continue
                     else:
@@ -285,7 +326,7 @@ class TriStarDriver:
 
             except Exception as e:
                 if attempt < 4:
-                    logging.warning(f"Exception, retry {attempt + 1}/5: {e}")
+                    logging.debug(f"Exception, retry {attempt + 1}/5: {e}")
                 else:
                     logging.error(f"Exception after 5 retries: {e}")
 
@@ -335,7 +376,7 @@ class TriStarDriver:
 
             except Exception as e:
                 if attempt < 4:
-                    logging.warning(f"Coil read exception, retry {attempt + 1}/5: {e}")
+                    logging.debug(f"Coil read exception, retry {attempt + 1}/5: {e}")
                 else:
                     logging.error(f"Coil read exception after 5 retries: {e}")
 
@@ -352,6 +393,7 @@ class TriStarDriver:
     def write_coil(self, address, value):
         """
         Write single coil with connect → write → close pattern
+        For critical coils (EQUALIZE, DISCONNECT), verify write with read-back
         """
         ip = self.settings['ip_address']
         port = self.settings['modbus_port']
@@ -381,11 +423,25 @@ class TriStarDriver:
 
                 client.close()
                 logging.info(f"Successfully wrote coil {address} = {value}")
+
+                # Critical coils: verify write succeeded by reading back
+                if address in [COIL_EQUALIZE, COIL_DISCONNECT]:
+                    sleep(0.1)  # Give TriStar time to process
+                    verify = self.read_coils(address, 1)
+                    if verify is None:
+                        logging.warning(f"Coil write verification failed: could not read back coil {address}")
+                        return False
+                    elif verify[0] != value:
+                        logging.error(f"Coil write verification failed for {address}: wrote {value}, read back {verify[0]}")
+                        return False
+                    else:
+                        logging.debug(f"Coil {address} verified: {value}")
+
                 return True
 
             except Exception as e:
                 if attempt < 4:
-                    logging.warning(f"Coil write exception, retry {attempt + 1}/5: {e}")
+                    logging.debug(f"Coil write exception, retry {attempt + 1}/5: {e}")
                 else:
                     logging.error(f"Coil write exception after 5 retries: {e}")
 
@@ -477,15 +533,54 @@ class TriStarDriver:
                     self.dbus['/Connected'] = 0
                     return True  # Continue timer
 
-            # Read all dynamic registers
+            # Read all dynamic registers (batch read: 24-79 = 56 registers)
+            # This reduces Modbus round-trips from 20+ to 1
             regs = self.read_input_registers(REG_V_BAT, REG_T_FLOAT - REG_V_BAT + 1)
             if regs is None:
-                self.dbus['/Connected'] = 0
-                self.initialized = False
+                # Update failure statistics
+                self.failed_reads += 1
+                self.consecutive_failures += 1
+                self.dbus['/Custom/Stats/FailedReads'] = self.failed_reads
+                self.dbus['/Custom/Stats/ConsecutiveFailures'] = self.consecutive_failures
+
+                # Check watchdog timeout
+                time_since_success = time() - self.last_successful_read
+                if time_since_success > self.watchdog_timeout:
+                    logging.warning(f"Connection watchdog timeout ({time_since_success:.0f}s > {self.watchdog_timeout}s)")
+                    self.dbus['/Connected'] = 0
+                    self.initialized = False
+
+                # Exponential backoff on persistent failures
+                if self.consecutive_failures >= 10:  # 10 failures = 50 seconds at 5s interval
+                    new_backoff = min(4, self.backoff_factor * 2)  # Max 4x interval
+                    if new_backoff != self.backoff_factor:
+                        self.backoff_factor = new_backoff
+                        self.dbus['/Custom/Stats/BackoffFactor'] = self.backoff_factor
+                        logging.warning(f"Too many consecutive failures ({self.consecutive_failures}), backing off to {self.backoff_factor}x poll interval")
+                        self._start_timer()
+
                 return True
 
-            # Mark as connected
+            # Mark as connected and update watchdog
             self.dbus['/Connected'] = 1
+            self.last_successful_read = time()
+
+            # Update success statistics
+            self.successful_reads += 1
+            self.dbus['/Custom/Stats/SuccessfulReads'] = self.successful_reads
+            self.dbus['/Custom/Stats/LastSuccessTime'] = int(time())
+
+            # Reset consecutive failures and backoff if recovered
+            if self.consecutive_failures > 0:
+                logging.info(f"Connection recovered after {self.consecutive_failures} failures")
+                self.consecutive_failures = 0
+                self.dbus['/Custom/Stats/ConsecutiveFailures'] = 0
+
+                if self.backoff_factor > 1:
+                    self.backoff_factor = 1
+                    self.dbus['/Custom/Stats/BackoffFactor'] = 1
+                    logging.info("Resetting to normal poll interval")
+                    self._start_timer()
 
             # Helper to get register by address
             def reg(addr):
@@ -496,13 +591,38 @@ class TriStarDriver:
             dt_ms = (now - self.last_update) * 1000
             self.last_update = now
 
-            # Parse and convert values
+            # Parse and convert values using TriStar scaling factors
+            # TriStar uses 16-bit signed registers with per-unit scaling:
+            #   - Voltage/Current: register_value × PU / 2^15 (32768)
+            #   - Power: (V × I) uses 2^17 scaling (131072)
             v_bat = reg(REG_V_BAT) * self.v_pu / 32768.0
             i_cc = max(0.0, self._to_signed(reg(REG_I_CC_1M)) * self.i_pu / 32768.0)
             v_pv = reg(REG_V_PV) * self.v_pu / 32768.0
             i_pv = reg(REG_I_PV) * self.i_pu / 32768.0
-            p_out = reg(REG_POUT) * self.i_pu * self.v_pu / 131072.0
+            p_out = reg(REG_POUT) * self.i_pu * self.v_pu / 131072.0  # 2^17 for power (V×I product)
             v_target = reg(REG_V_TARGET) * self.v_pu / 32768.0
+
+            # Sanity checks on critical values (protect against Modbus corruption over WAN)
+            # LiFePO4 7S nominal: 21V-29.4V, allow margin for system voltage variations
+            if not (18.0 <= v_bat <= 35.0):
+                logging.warning(f"Unrealistic battery voltage: {v_bat:.2f}V - possible Modbus corruption, skipping update")
+                # Don't update statistics on corrupt data
+                return True
+
+            # TriStar MPPT 60: max PV input 150V
+            if not (0 <= v_pv <= 160.0):
+                logging.warning(f"Unrealistic PV voltage: {v_pv:.2f}V - possible Modbus corruption, skipping update")
+                return True
+
+            # TriStar MPPT 60: max charge current 60A
+            if not (0 <= i_cc <= 70.0):
+                logging.warning(f"Unrealistic charge current: {i_cc:.2f}A - possible Modbus corruption, skipping update")
+                return True
+
+            # Max output power sanity check (60A × 35V = 2100W, allow margin)
+            if not (0 <= p_out <= 2500.0):
+                logging.warning(f"Unrealistic output power: {p_out:.0f}W - possible Modbus corruption, skipping update")
+                return True
 
             # Charge state
             cs_raw = reg(REG_CHARGE_STATE)
@@ -527,7 +647,7 @@ class TriStarDriver:
             # History
             self.dbus['/History/Daily/0/Yield'] = round(reg(REG_WHC_DAILY) / 1000.0, 2)
             self.dbus['/History/Daily/0/MaxPower'] = round(
-                reg(REG_POUT_MAX_DAILY) * self.i_pu * self.v_pu / 131072.0, 0
+                reg(REG_POUT_MAX_DAILY) * self.i_pu * self.v_pu / 131072.0, 0  # 2^17 scaling
             )
             self.dbus['/History/Daily/0/MaxPvVoltage'] = round(
                 reg(REG_V_PV_MAX) * self.v_pu / 32768.0, 2
@@ -552,6 +672,8 @@ class TriStarDriver:
             if coils is not None:
                 self.dbus['/Control/EqualizeTriggered'] = int(coils[0])
                 self.dbus['/Control/ChargerDisconnect'] = int(coils[2])
+            else:
+                logging.warning("Failed to read coils - control status may be stale")
 
             # Nightly reset at 03:00
             self._check_nightly_reset()
@@ -570,15 +692,22 @@ class TriStarDriver:
 
         # Check if it's 03:00-03:04 (5-minute window to catch it)
         if current_hour == 3 and current_minute < 5:
-            # Only reset once per day
+            # Only attempt reset once per day
             if self.last_reset_date != current_date:
-                logging.info("Performing nightly comm server reset at 03:00")
+                # Mark as attempted BEFORE trying (prevent retry spam if write fails)
+                self.last_reset_date = current_date
+
+                logging.info("Performing nightly comm server reset and daily counters reset at 03:00")
+
+                # Reset daily counters
+                self.t_bulk_ms = 0
+
+                # Reset comm server
                 success = self.write_coil(COIL_RESET_COMM, True)
                 if success:
-                    self.last_reset_date = current_date
                     logging.info("Nightly reset completed successfully")
                 else:
-                    logging.error("Nightly reset failed")
+                    logging.error("Nightly reset failed - will retry tomorrow")
 
     @staticmethod
     def _to_signed(value):
@@ -598,6 +727,20 @@ def main():
     logging.info(f"dbus-tristar v{VERSION} starting")
     logging.info("Venus OS compatible using SettingsDevice")
 
+    # Setup graceful shutdown handlers
+    mainloop = None
+
+    def cleanup_and_exit(signum=None, frame=None):
+        """Handle shutdown signals gracefully"""
+        sig_name = signal.Signals(signum).name if signum else "unknown"
+        logging.info(f"Received signal {sig_name} - shutting down gracefully...")
+        if mainloop:
+            mainloop.quit()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, cleanup_and_exit)
+    signal.signal(signal.SIGINT, cleanup_and_exit)
+
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     driver = TriStarDriver()
 
@@ -605,7 +748,8 @@ def main():
     logging.info("Configure via: dbus -y com.victronenergy.settings /Settings/TristarMPPT/...")
     logging.info("Entering main loop...")
 
-    GLib.MainLoop().run()
+    mainloop = GLib.MainLoop()
+    mainloop.run()
 
 
 if __name__ == '__main__':
