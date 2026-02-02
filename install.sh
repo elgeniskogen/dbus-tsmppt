@@ -3,11 +3,15 @@ set -e
 
 # Installation script for TriStar MPPT driver
 # For Venus OS v3.4+ (including v3.67)
-# NO QML REQUIRED - NO compilation needed!
+# Uses CORRECT daemontools structure with persistent storage
 
-# Installation directory (persistent across firmware updates)
-INSTALL_DIR=/data/dbus-tristar
+SERVICE_NAME=dbus-tristar
 SCRIPT_NAME=dbus_tristar.py
+
+# Persistent directories (survive firmware updates)
+INSTALL_DIR=/data/$SERVICE_NAME
+SERVICE_DIR=/data/etc/sv/$SERVICE_NAME
+LOG_DIR=/data/log/$SERVICE_NAME
 
 echo "================================================================"
 echo "TriStar MPPT Driver Installation (Venus OS v3.4+)"
@@ -17,7 +21,7 @@ echo "Modern Python driver - zero compilation, easy configuration."
 echo "NO QML files needed - configure via D-Bus command line."
 echo ""
 
-# Create installation directory
+# Create installation directory for scripts
 echo "Creating installation directory: $INSTALL_DIR"
 mkdir -p $INSTALL_DIR
 
@@ -26,47 +30,64 @@ echo "Installing driver..."
 cp $SCRIPT_NAME $INSTALL_DIR/
 chmod +x $INSTALL_DIR/$SCRIPT_NAME
 
-# Create service structure (if using daemontools/runit)
-if [ -d /service ]; then
-    echo "Setting up service..."
+# Create service directory structure (daemontools persistent)
+echo "Setting up persistent service structure..."
+mkdir -p $SERVICE_DIR/log
+mkdir -p $LOG_DIR
 
-    # Create service directory
-    mkdir -p $INSTALL_DIR/service
-    mkdir -p $INSTALL_DIR/service/log
-
-    # Create run script
-    cat > $INSTALL_DIR/service/run << 'EOF'
+# Create run script (main service)
+cat > $SERVICE_DIR/run << 'EOF'
 #!/bin/sh
+echo "*** starting dbus-tristar ***"
 exec 2>&1
-exec python3 /data/dbus-tristar/dbus_tristar.py
+exec python3 -u /data/dbus-tristar/dbus_tristar.py
 EOF
-    chmod +x $INSTALL_DIR/service/run
+chmod +x $SERVICE_DIR/run
 
-    # Create log run script
-    cat > $INSTALL_DIR/service/log/run << 'EOF'
+# Create log run script
+cat > $SERVICE_DIR/log/run << 'EOF'
 #!/bin/sh
-exec multilog t s25000 n4 /var/log/dbus-tristar
+exec svlogd -tt /data/log/dbus-tristar
 EOF
-    chmod +x $INSTALL_DIR/service/log/run
+chmod +x $SERVICE_DIR/log/run
 
-    # Remove old symlink if it exists
-    if [ -L /service/dbus-tristar ]; then
-        rm /service/dbus-tristar
-    fi
+echo "✓ Service structure created"
 
-    # Create symlink to /service
-    ln -sf $INSTALL_DIR/service /service/dbus-tristar
+# Setup rc.local for automatic symlink restoration on boot
+RC_LOCAL=/data/rc.local
 
-    echo "✓ Service created"
+if [ ! -f $RC_LOCAL ]; then
+    echo "Creating /data/rc.local..."
+    cat > $RC_LOCAL << 'EOF'
+#!/bin/sh
 
-    # Start service
-    echo "Starting service..."
-    svc -u /service/dbus-tristar
-    sleep 2
-    svstat /service/dbus-tristar
+# Re-create service symlinks at boot (persistent across reboots)
+ln -sf /data/etc/sv/dbus-tristar /service/dbus-tristar
+
+exit 0
+EOF
+    chmod +x $RC_LOCAL
+    echo "✓ Created /data/rc.local"
 else
-    echo "Note: /service directory not found - manual start required"
+    # Check if our service is already in rc.local
+    if ! grep -q "dbus-tristar" $RC_LOCAL; then
+        echo "Adding dbus-tristar to existing /data/rc.local..."
+        # Insert before 'exit 0'
+        sed -i '/^exit 0/i ln -sf /data/etc/sv/dbus-tristar /service/dbus-tristar' $RC_LOCAL
+        echo "✓ Added to /data/rc.local"
+    else
+        echo "✓ Already in /data/rc.local"
+    fi
 fi
+
+# Create symlink (starts service immediately)
+echo "Creating service symlink..."
+if [ -L /service/$SERVICE_NAME ]; then
+    rm /service/$SERVICE_NAME
+fi
+ln -sf $SERVICE_DIR /service/$SERVICE_NAME
+
+echo "✓ Service symlink created"
 
 # Install Python dependencies if not present
 if ! python3 -c "import pymodbus" 2>/dev/null; then
@@ -77,14 +98,27 @@ else
     echo "✓ pymodbus already installed"
 fi
 
+# Wait for service to start
+echo ""
+echo "Waiting for service to start..."
+sleep 5
+
+# Check service status
+echo ""
+echo "Service status:"
+svstat /service/$SERVICE_NAME
+
 echo ""
 echo "================================================================"
 echo "✓ Installation complete!"
 echo "================================================================"
 echo ""
-echo "Installation location: $INSTALL_DIR"
-echo "Service directory: /service/dbus-tristar"
-echo "Log directory: /var/log/dbus-tristar"
+echo "STRUCTURE:"
+echo "  Driver:      $INSTALL_DIR/$SCRIPT_NAME"
+echo "  Service:     $SERVICE_DIR/ (persistent)"
+echo "  Logs:        $LOG_DIR/current"
+echo "  Autostart:   /data/rc.local"
+echo "  Symlink:     /service/$SERVICE_NAME → $SERVICE_DIR"
 echo ""
 echo "📋 NEXT STEP: Configure via D-Bus command line"
 echo ""
@@ -98,15 +132,18 @@ echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/SlaveID SetValu
 echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/DeviceInstance SetValue 0"
 echo ""
 echo "After configuring, restart the driver:"
-echo "  svc -t /service/dbus-tristar"
+echo "  svc -t /service/$SERVICE_NAME"
 echo ""
 echo "📊 Verification:"
 echo ""
 echo "Check service status:"
-echo "  svstat /service/dbus-tristar"
+echo "  svstat /service/$SERVICE_NAME"
 echo ""
 echo "Check logs:"
-echo "  tail -f /var/log/dbus-tristar/current"
+echo "  tail -f $LOG_DIR/current"
+echo ""
+echo "Check logs with timestamps:"
+echo "  tail -f $LOG_DIR/current | tai64nlocal"
 echo ""
 echo "Check D-Bus registration:"
 echo "  dbus -y com.victronenergy.solarcharger.tristar_0 /ProductName GetValue"
@@ -115,6 +152,5 @@ echo "Check current values:"
 echo "  dbus -y com.victronenergy.solarcharger.tristar_0 /Dc/0/Voltage GetValue"
 echo "  dbus -y com.victronenergy.solarcharger.tristar_0 /Yield/Power GetValue"
 echo ""
-echo "Once configured, your TriStar MPPT will appear as a Solar Charger"
-echo "in the Venus OS main screen and VRM Portal!"
+echo "✅ Service will AUTO-START after reboot (configured in /data/rc.local)"
 echo ""
