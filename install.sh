@@ -5,7 +5,8 @@ set -e
 # For Venus OS v3.4+ (including v3.67)
 # NO QML REQUIRED - NO compilation needed!
 
-PLUGIN_DIR=/data/venus-data/dbus-plugins/tristar
+# Installation directory (persistent across firmware updates)
+INSTALL_DIR=/data/dbus-tristar
 SCRIPT_NAME=dbus_tristar.py
 
 echo "================================================================"
@@ -16,38 +17,45 @@ echo "Modern Python driver - zero compilation, easy configuration."
 echo "NO QML files needed - configure via D-Bus command line."
 echo ""
 
-# Create plugin directory
-echo "Creating plugin directory..."
-mkdir -p $PLUGIN_DIR
+# Create installation directory
+echo "Creating installation directory: $INSTALL_DIR"
+mkdir -p $INSTALL_DIR
 
 # Copy driver
 echo "Installing driver..."
-cp $SCRIPT_NAME $PLUGIN_DIR/
-chmod +x $PLUGIN_DIR/$SCRIPT_NAME
+cp $SCRIPT_NAME $INSTALL_DIR/
+chmod +x $INSTALL_DIR/$SCRIPT_NAME
 
-# Create symlink for auto-start (if using daemontools/runit)
+# Create service structure (if using daemontools/runit)
 if [ -d /service ]; then
-    # Create service directory in plugin folder
-    mkdir -p $PLUGIN_DIR/service
-    mkdir -p $PLUGIN_DIR/service/log
+    echo "Setting up service..."
+
+    # Create service directory
+    mkdir -p $INSTALL_DIR/service
+    mkdir -p $INSTALL_DIR/service/log
 
     # Create run script
-    cat > $PLUGIN_DIR/service/run << 'EOF'
+    cat > $INSTALL_DIR/service/run << 'EOF'
 #!/bin/sh
 exec 2>&1
-exec python3 /data/venus-data/dbus-plugins/tristar/dbus_tristar.py
+exec python3 /data/dbus-tristar/dbus_tristar.py
 EOF
-    chmod +x $PLUGIN_DIR/service/run
+    chmod +x $INSTALL_DIR/service/run
 
     # Create log run script
-    cat > $PLUGIN_DIR/service/log/run << 'EOF'
+    cat > $INSTALL_DIR/service/log/run << 'EOF'
 #!/bin/sh
 exec multilog t s25000 n4 /var/log/dbus-tristar
 EOF
-    chmod +x $PLUGIN_DIR/service/log/run
+    chmod +x $INSTALL_DIR/service/log/run
 
-    # Link to /service
-    ln -sf $PLUGIN_DIR/service /service/dbus-tristar
+    # Remove old symlink if it exists
+    if [ -L /service/dbus-tristar ]; then
+        rm /service/dbus-tristar
+    fi
+
+    # Create symlink to /service
+    ln -sf $INSTALL_DIR/service /service/dbus-tristar
 
     echo "✓ Service created"
 
@@ -74,7 +82,9 @@ echo "================================================================"
 echo "✓ Installation complete!"
 echo "================================================================"
 echo ""
-echo "The driver is now running as a service."
+echo "Installation location: $INSTALL_DIR"
+echo "Service directory: /service/dbus-tristar"
+echo "Log directory: /var/log/dbus-tristar"
 echo ""
 echo "📋 NEXT STEP: Configure via D-Bus command line"
 echo ""
@@ -85,11 +95,15 @@ echo "Optional settings (with defaults):"
 echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/PortNumber SetValue 502"
 echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/Interval SetValue 5000"
 echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/SlaveID SetValue 1"
+echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/DeviceInstance SetValue 0"
 echo ""
 echo "After configuring, restart the driver:"
 echo "  svc -t /service/dbus-tristar"
 echo ""
 echo "📊 Verification:"
+echo ""
+echo "Check service status:"
+echo "  svstat /service/dbus-tristar"
 echo ""
 echo "Check logs:"
 echo "  tail -f /var/log/dbus-tristar/current"
@@ -97,8 +111,9 @@ echo ""
 echo "Check D-Bus registration:"
 echo "  dbus -y com.victronenergy.solarcharger.tristar_0 /ProductName GetValue"
 echo ""
-echo "Check current IP setting:"
-echo "  dbus -y com.victronenergy.settings /Settings/TristarMPPT/IPAddress GetValue"
+echo "Check current values:"
+echo "  dbus -y com.victronenergy.solarcharger.tristar_0 /Dc/0/Voltage GetValue"
+echo "  dbus -y com.victronenergy.solarcharger.tristar_0 /Yield/Power GetValue"
 echo ""
 echo "Once configured, your TriStar MPPT will appear as a Solar Charger"
 echo "in the Venus OS main screen and VRM Portal!"

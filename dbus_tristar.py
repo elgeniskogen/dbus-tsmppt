@@ -94,7 +94,7 @@ class TriStarDriver:
         self.settings = SettingsDevice(
             bus=self.bus,
             supportedSettings={
-                'ip_address': ['/Settings/TristarMPPT/IPAddress', '192.168.1.100', 0, 0],
+                'ip_address': ['/Settings/TristarMPPT/IPAddress', '192.168.2.103', 0, 0],
                 'modbus_port': ['/Settings/TristarMPPT/PortNumber', 502, 1, 65535],
                 'poll_interval': ['/Settings/TristarMPPT/Interval', 5000, 1000, 60000],
                 'slave_id': ['/Settings/TristarMPPT/SlaveID', 1, 1, 247],
@@ -166,7 +166,7 @@ class TriStarDriver:
         s.add_path('/FirmwareVersion', 0)
         s.add_path('/HardwareVersion', '')
         s.add_path('/Serial', '')
-        s.add_path('/DeviceInstance', 0)
+        s.add_path('/DeviceInstance', int(self.settings['device_instance']))
         s.add_path('/Connected', 0)
         s.add_path('/Mode', 1)
         s.add_path('/ErrorCode', 0)

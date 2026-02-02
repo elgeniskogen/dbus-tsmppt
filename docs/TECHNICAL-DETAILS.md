@@ -358,8 +358,23 @@ All D-Bus paths are automatically published to Venus OS MQTT broker:
 
 **Topics:**
 ```
-N/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered      # Read
-W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered      # Write
+N/<portal-id>/solarcharger/0/Control/EqualizeTriggered      # Read (MQTT uses device instance)
+W/<portal-id>/solarcharger/0/Control/EqualizeTriggered      # Write (MQTT uses device instance)
+```
+
+**IMPORTANT:**
+- Venus OS MQTT write **requires JSON format**: `{"value": 1}` not just `1`
+- MQTT topics use **device instance** (e.g., `solarcharger/0`), not service name (e.g., `solarcharger/tristar_0`)
+- D-Bus service name is `com.victronenergy.solarcharger.tristar_0` (internal)
+- MQTT topic uses `/solarcharger/0` (external, based on DeviceInstance setting)
+
+**Write example:**
+```bash
+# Trigger equalize charge
+mosquitto_pub -h <venus-ip> -t "W/b827ebe38b8c/solarcharger/0/Control/EqualizeTriggered" -m '{"value": 1}'
+
+# Stop equalize charge
+mosquitto_pub -h <venus-ip> -t "W/b827ebe38b8c/solarcharger/0/Control/EqualizeTriggered" -m '{"value": 0}'
 ```
 
 **Home Assistant example:**
@@ -368,8 +383,8 @@ mqtt:
   switch:
     - unique_id: tristar_equalize
       name: "TriStar Equalize"
-      state_topic: "N/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered"
-      command_topic: "W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered"
+      state_topic: "N/<portal-id>/solarcharger/0/Control/EqualizeTriggered"
+      command_topic: "W/<portal-id>/solarcharger/0/Control/EqualizeTriggered"
       payload_on: '{"value": 1}'
       payload_off: '{"value": 0}'
 ```

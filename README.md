@@ -195,6 +195,22 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Stats/LastSuccessTime G
 - Use D-Bus command line instead (see Configuration section)
 - Settings are fully functional via D-Bus
 
+**MQTT write not working?**
+- **CRITICAL:** Venus OS MQTT requires JSON format: `{"value": 1}` not just `1`
+- MQTT topics use device instance (e.g., `solarcharger/0`), not service name (e.g., `tristar_0`)
+- Test D-Bus write first to verify driver is working:
+  ```bash
+  dbus -y com.victronenergy.solarcharger.tristar_0 /Control/EqualizeTriggered SetValue 1
+  ```
+- Example MQTT write command:
+  ```bash
+  mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/EqualizeTriggered" -m '{"value": 1}'
+  ```
+- Check logs after MQTT write to see if driver received the command:
+  ```bash
+  tail -f /var/log/dbus-tristar/current | grep "Coil write"
+  ```
+
 ---
 
 ## Technical Details
@@ -244,6 +260,13 @@ N/<portal-id>/solarcharger/tristar_0/Control/ChargerDisconnect
 W/<portal-id>/solarcharger/tristar_0/Control/EqualizeTriggered {"value": 1}
 W/<portal-id>/solarcharger/tristar_0/Control/ResetController {"value": 1}
 ```
+
+**IMPORTANT:** Venus OS MQTT write requires JSON format. Use `{"value": 1}` not just `1`.
+
+**Note:**
+- Replace `<portal-id>` with your Venus OS VRM Portal ID (found in Settings → VRM Portal)
+- Replace `tristar_0` with `0` if using default device instance (MQTT uses device instance, not service name)
+- Example: `W/b827ebe38b8c/solarcharger/0/Control/EqualizeTriggered {"value": 1}`
 
 ### Example HA Configuration
 
