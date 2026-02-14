@@ -81,6 +81,20 @@ CHARGE_STATE_MAP = {
     9: 11   # SLAVE -> OTHER
 }
 
+# TriStar charge state text (raw TriStar values)
+CHARGE_STATE_TEXT = {
+    0: "START",
+    1: "NIGHT_CHECK",
+    2: "DISCONNECT",
+    3: "NIGHT",
+    4: "FAULT",
+    5: "MPPT",
+    6: "ABSORPTION",
+    7: "FLOAT",
+    8: "EQUALIZE",
+    9: "SLAVE"
+}
+
 
 class TriStarDriver:
     """Main driver class for TriStar MPPT"""
@@ -179,7 +193,6 @@ class TriStarDriver:
         s.add_path('/Dc/0/Voltage', None, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Dc/0/Current', None, gettextcallback=lambda p, v: f"{v}A")
         s.add_path('/Dc/0/Temperature', None)
-        s.add_path('/Settings/ChargeTargetVoltage', None, gettextcallback=lambda p, v: f"{v}V")
 
         # Power and state
         s.add_path('/Yield/Power', None, gettextcallback=lambda p, v: f"{v}W")
@@ -212,6 +225,11 @@ class TriStarDriver:
         s.add_path('/Custom/Stats/ConsecutiveFailures', 0, writeable=False)
         s.add_path('/Custom/Stats/LastSuccessTime', 0, writeable=False)  # Unix timestamp
         s.add_path('/Custom/Stats/BackoffFactor', 1, writeable=False)  # Poll interval multiplier
+
+        # TriStar-specific charge state (raw values from TriStar)
+        s.add_path('/Custom/ChargeState', None, writeable=False)  # Raw TriStar charge state (0-9)
+        s.add_path('/Custom/ChargeStateText', None, writeable=False)  # Text representation
+        s.add_path('/Custom/TargetRegulationVoltage', None, writeable=False, gettextcallback=lambda p, v: f"{v}V")  # Target regulation voltage
 
     def _start_timer(self):
         """Start or restart the periodic update timer (with exponential backoff support)"""
@@ -394,10 +412,14 @@ class TriStarDriver:
         """
         Write single coil with connect → write → close pattern
         For critical coils (EQUALIZE, DISCONNECT), verify write with read-back
+        For reset coils (RESET_CTRL, RESET_COMM), timeout is expected behavior
         """
         ip = self.settings['ip_address']
         port = self.settings['modbus_port']
         slave_id = self.settings['slave_id']
+
+        # Reset coils drop connection immediately - timeout is expected
+        is_reset_coil = address in [COIL_RESET_CTRL, COIL_RESET_COMM]
 
         for attempt in range(5):
             client = ModbusTcpClient(host=ip, port=port, timeout=1, retries=0)
@@ -407,6 +429,10 @@ class TriStarDriver:
                     if attempt < 4:
                         continue
                     else:
+                        # For reset coils, connection failure is expected
+                        if is_reset_coil:
+                            logging.info(f"Reset coil {address} sent (connection dropped as expected)")
+                            return True
                         logging.error(f"Failed to connect for coil write after 5 retries")
                         return False
 
@@ -440,6 +466,11 @@ class TriStarDriver:
                 return True
 
             except Exception as e:
+                # For reset coils, timeout/exception is expected - TriStar resets and drops connection
+                if is_reset_coil and attempt == 4:
+                    logging.info(f"Reset coil {address} sent (timeout expected - comm server reset)")
+                    return True
+
                 if attempt < 4:
                     logging.debug(f"Coil write exception, retry {attempt + 1}/5: {e}")
                 else:
@@ -640,9 +671,13 @@ class TriStarDriver:
             self.dbus['/Dc/0/Voltage'] = round(v_bat, 2)
             self.dbus['/Dc/0/Current'] = round(i_cc, 2)
             self.dbus['/Dc/0/Temperature'] = round(self._to_signed(reg(REG_T_BAT)), 1)
-            self.dbus['/Settings/ChargeTargetVoltage'] = round(v_target, 2)
             self.dbus['/Yield/Power'] = round(p_out, 0)
             self.dbus['/State'] = cs
+
+            # Custom TriStar-specific values
+            self.dbus['/Custom/ChargeState'] = cs_raw
+            self.dbus['/Custom/ChargeStateText'] = CHARGE_STATE_TEXT.get(cs_raw, "UNKNOWN")
+            self.dbus['/Custom/TargetRegulationVoltage'] = round(v_target, 2)
 
             # History
             self.dbus['/History/Daily/0/Yield'] = round(reg(REG_WHC_DAILY) / 1000.0, 2)

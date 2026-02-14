@@ -9,7 +9,11 @@
 ✅ **WAN-ready** - Works over internet with optimized timeouts
 
 TO DO:
-* Make a path with the Tristar charger states, both number and text
+* Make a path with the Tristar charger states, both number and text (ca_raw in code)
+* Add fields to comply with VRM Installation data: 
+* CHeck is regulation voltage is available on dbus
+* Check that comm restart is actually working
+* Check time used for restrart and for resetting counters: local time vs UTC
 * Check modbus parameters to be used for I and V. Now it is a mix of fast and slow. 
 * Make filters similar to those in the templates in HS
 ---

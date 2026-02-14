@@ -47,7 +47,8 @@ chmod +x $SERVICE_DIR/run
 # Create log run script
 cat > $SERVICE_DIR/log/run << 'EOF'
 #!/bin/sh
-exec svlogd -tt /data/log/dbus-tristar
+exec 2>&1
+exec multilog t s25000 n4 /data/log/dbus-tristar
 EOF
 chmod +x $SERVICE_DIR/log/run
 
