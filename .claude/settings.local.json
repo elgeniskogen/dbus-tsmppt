@@ -1,7 +1,17 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mv:*)"
+      "Bash(mv:*)",
+      "Bash(pdftotext:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.victronenergy.com)",
+      "Bash(grep -r \"Current\\\\|--A\\\\|display\" /Users/erik/Documents/Dev/venus/dbus-tsmppt/*.md)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)",
+      "WebFetch(domain:community.victronenergy.com)",
+      "WebFetch(domain:communityarchive.victronenergy.com)",
+      "WebFetch(domain:mr-manuel.github.io)",
+      "Bash(scp /Users/erik/Documents/Dev/venus/dbus-tsmppt/dbus_tristar.py root@192.168.2.102:/data/dbus-tristar/)"
     ],
     "deny": [],
     "ask": []

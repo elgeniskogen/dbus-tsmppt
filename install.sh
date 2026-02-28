@@ -35,10 +35,28 @@ echo "Setting up persistent service structure..."
 mkdir -p $SERVICE_DIR/log
 mkdir -p $LOG_DIR
 
-# Create run script (main service)
+# Create run script (main service with vrmlogger dependency)
 cat > $SERVICE_DIR/run << 'EOF'
 #!/bin/sh
 echo "*** starting dbus-tristar ***"
+
+# Wait for vrmlogger to be running (max 30 seconds)
+echo "Waiting for vrmlogger to start..."
+COUNTER=0
+while [ $COUNTER -lt 30 ]; do
+    if svstat /service/vrmlogger 2>/dev/null | grep -q "up"; then
+        echo "vrmlogger is running, proceeding..."
+        sleep 2  # Extra 2 seconds to ensure vrmlogger has done service discovery
+        break
+    fi
+    sleep 1
+    COUNTER=$((COUNTER + 1))
+done
+
+if [ $COUNTER -ge 30 ]; then
+    echo "WARNING: vrmlogger not detected after 30 seconds, starting anyway..."
+fi
+
 exec 2>&1
 exec python3 -u /data/dbus-tristar/dbus_tristar.py
 EOF
