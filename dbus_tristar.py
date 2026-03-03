@@ -11,10 +11,12 @@ Configure via: dbus -y com.victronenergy.settings /Settings/TristarMPPT/...
 import logging
 import sys
 import signal
+import os
 import dbus
 import dbus.mainloop.glib
 from gi.repository import GLib
 from time import time, sleep
+import time as time_module
 from datetime import datetime, time as dt_time, timezone, timedelta
 import json
 from pathlib import Path
@@ -30,8 +32,29 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.2"  # WAN-optimized with watchdog, backoff, validation, and diagnostics
+VERSION = "2.24"  # Fix: Remove t_bulk_ms reset from nightly, use local time, add CONFIG section
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
+
+# ============================================================================
+# CONFIGURATION - Edit these values to customize driver behavior
+# ============================================================================
+
+CONFIG = {
+    # Device connection (can also be set via D-Bus /Settings/TristarMPPT/...)
+    'default_ip': '192.168.2.103',
+    'default_modbus_port': 502,
+    'default_slave_id': 1,
+    'default_device_instance': 0,
+    'default_poll_interval_ms': 5000,  # Update interval (milliseconds)
+
+    # Timing
+    'state_save_interval_sec': 300,    # Save state.json every 5 minutes
+    'watchdog_timeout_sec': 180,       # Mark disconnected after 3 min without Modbus
+    'nightly_reset_hour': 3,           # TriStar comm reset at 03:00 local time
+
+    # Device identification
+    'custom_name': 'TriStar MPPT 60',
+}
 
 # Persistent state file for yield tracking and 30-day history
 STATE_FILE = Path("/data/dbus-tristar/state.json")
@@ -170,11 +193,14 @@ class TriStarDriver:
         self.settings = SettingsDevice(
             bus=self.bus,
             supportedSettings={
-                'ip_address': ['/Settings/TristarMPPT/IPAddress', '192.168.2.103', 0, 0],
-                'modbus_port': ['/Settings/TristarMPPT/PortNumber', 502, 1, 65535],
-                'poll_interval': ['/Settings/TristarMPPT/Interval', 5000, 1000, 60000],
-                'slave_id': ['/Settings/TristarMPPT/SlaveID', 1, 1, 247],
-                'device_instance': ['/Settings/TristarMPPT/DeviceInstance', 0, 0, 255],
+                'ip_address': ['/Settings/TristarMPPT/IPAddress', CONFIG['default_ip'], 0, 0],
+                'modbus_port': ['/Settings/TristarMPPT/PortNumber', CONFIG['default_modbus_port'], 1, 65535],
+                'poll_interval': ['/Settings/TristarMPPT/Interval', CONFIG['default_poll_interval_ms'], 1000, 60000],
+                'slave_id': ['/Settings/TristarMPPT/SlaveID', CONFIG['default_slave_id'], 1, 247],
+                'device_instance': ['/Settings/TristarMPPT/DeviceInstance', CONFIG['default_device_instance'], 0, 255],
+                'state_save_interval': ['/Settings/TristarMPPT/StateSaveInterval', CONFIG['state_save_interval_sec'], 60, 3600],
+                'watchdog_timeout': ['/Settings/TristarMPPT/WatchdogTimeout', CONFIG['watchdog_timeout_sec'], 30, 600],
+                'nightly_reset_hour': ['/Settings/TristarMPPT/NightlyResetHour', CONFIG['nightly_reset_hour'], 0, 23],
             },
             eventCallback=self._setting_changed
         )
@@ -196,9 +222,13 @@ class TriStarDriver:
         self.t_bulk_ms = 0
         self.last_update = time()
 
+        # Periodic state saving
+        self.last_state_save_time = time()
+        self.state_save_interval = self.settings['state_save_interval']
+
         # Connection watchdog (track last successful read)
         self.last_successful_read = time()
-        self.watchdog_timeout = 180  # 3 minutes - mark as disconnected if no successful reads
+        self.watchdog_timeout = self.settings['watchdog_timeout']
 
         # Statistics for diagnostics
         self.successful_reads = 0
@@ -211,18 +241,42 @@ class TriStarDriver:
         # Load persistent state (total yield and 30-day history)
         self.state = self._load_state()
 
-        # Daily value trackers (reset at midnight)
-        self.daily_max_battery_current = 0.0
-        self.daily_max_power = 0.0
-        self.daily_max_battery_voltage = 0.0
-        self.daily_min_battery_voltage = 999.0  # Will be updated to actual value
-        self.daily_max_pv_voltage = 0.0
+        # Ensure lifetime tracking exists in state (for backwards compatibility)
+        if 'lifetime' not in self.state:
+            self.state['lifetime'] = {
+                "max_pv_voltage": 0.0,
+                "max_battery_voltage": 0.0,
+                "min_battery_voltage": 999.0
+            }
+
+        # Ensure today tracking exists in state (for backwards compatibility)
+        if 'today' not in self.state:
+            self.state['today'] = {
+                "max_battery_current": 0.0,
+                "max_power": 0.0,
+                "max_pv_voltage": 0.0,
+                "max_battery_voltage": 0.0,
+                "min_battery_voltage": 999.0,
+                "time_bulk": 0
+            }
+
+        # Daily value trackers (reset at midnight) - load from state to preserve across restarts
+        self.daily_max_battery_current = self.state['today'].get('max_battery_current', 0.0)
+        self.daily_max_power = self.state['today'].get('max_power', 0.0)
+        self.daily_max_battery_voltage = self.state['today'].get('max_battery_voltage', 0.0)
+        self.daily_min_battery_voltage = self.state['today'].get('min_battery_voltage', 999.0)
+        self.daily_max_pv_voltage = self.state['today'].get('max_pv_voltage', 0.0)
+
+        # Load time_bulk from state (tracked by driver, not Modbus)
+        time_bulk_minutes = self.state['today'].get('time_bulk', 0)
+        self.t_bulk_ms = time_bulk_minutes * 60 * 1000  # Convert minutes to milliseconds
 
         # Nightly reset tracking
         self.last_reset_date = self.state.get('current_date')
 
         # Daily register reset detection (for post-midnight, pre-sunrise handling)
-        self.daily_register_has_reset = False  # Reset when new day starts
+        # Load from state (persists across restarts to know if Modbus is valid)
+        self.daily_register_has_reset = self.state.get('daily_register_has_reset', True)
         self.last_daily_register_value = 0
 
         # Track which history days have D-Bus paths created (for dynamic path creation)
@@ -276,7 +330,21 @@ class TriStarDriver:
             "total_yield_kwh": 0.0,
             "last_update": datetime.utcnow().isoformat() + "Z",
             "current_date": self._get_local_date(),
-            "history": []  # Will grow to 30 days
+            "daily_register_has_reset": True,  # Assume Modbus valid initially
+            "today": {
+                "max_battery_current": 0.0,
+                "max_power": 0.0,
+                "max_pv_voltage": 0.0,
+                "max_battery_voltage": 0.0,
+                "min_battery_voltage": 999.0,
+                "time_bulk": 0
+            },
+            "history": [],  # Will grow to 30 days
+            "lifetime": {
+                "max_pv_voltage": 0.0,
+                "max_battery_voltage": 0.0,
+                "min_battery_voltage": 999.0  # High initial value so first real value will be lower
+            }
         }
 
     def _save_state(self):
@@ -300,13 +368,34 @@ class TriStarDriver:
             logging.error(f"Error saving state: {e}")
 
     def _get_local_date(self):
-        """Get current date in local timezone (system time)"""
+        """Get current date in local timezone from D-Bus timezone setting"""
         try:
-            # Use system local time (respects Venus OS timezone setting)
-            return datetime.now().date().isoformat()
+            # Read timezone from Venus OS D-Bus settings (e.g., 'Europe/Paris')
+            bus = dbus.SystemBus()
+            settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
+            tz_string = settings.GetValue()
+
+            # Temporarily set TZ environment variable to get correct local time
+            old_tz = os.environ.get('TZ', '')
+            os.environ['TZ'] = tz_string
+            time_module.tzset()
+
+            # Get local date in the configured timezone
+            local_date = time_module.strftime('%Y-%m-%d', time_module.localtime())
+
+            # Restore original TZ setting
+            if old_tz:
+                os.environ['TZ'] = old_tz
+            else:
+                if 'TZ' in os.environ:
+                    del os.environ['TZ']
+            time_module.tzset()
+
+            return local_date
 
         except Exception as e:
-            logging.error(f"Error getting local date: {e}")
+            logging.error(f"Error getting local date from timezone: {e}")
+            # Fallback to UTC date
             return datetime.now().date().isoformat()
 
     def _update_historical_days(self):
@@ -372,16 +461,17 @@ class TriStarDriver:
             if current_date != self.last_reset_date:
                 logging.info(f"Midnight detected! Date changed: {self.last_reset_date} → {current_date}")
 
-                # Snapshot yesterday's final values (from day 0 before reset)
-                # Capture current Day 0 values which have been tracking all day
+                # Snapshot yesterday's final values from state (not memory)
+                # This ensures correct values even if driver restarted between midnight and sunrise
+                # Values are saved every 5 minutes, so state has the latest values
                 yesterday_snapshot = {
                     "date": self.last_reset_date,
                     "yield": current_daily_kwh,  # Use REG_WHC_DAILY before it resets
-                    "max_power": self.daily_max_power,
-                    "max_pv_voltage": self.daily_max_pv_voltage,
-                    "max_battery_voltage": self.daily_max_battery_voltage,
-                    "min_battery_voltage": self.daily_min_battery_voltage if self.daily_min_battery_voltage < 999 else 0.0,
-                    "max_battery_current": self.daily_max_battery_current,
+                    "max_power": self.state['today']['max_power'],
+                    "max_pv_voltage": self.state['today']['max_pv_voltage'],
+                    "max_battery_voltage": self.state['today']['max_battery_voltage'],
+                    "min_battery_voltage": self.state['today']['min_battery_voltage'] if self.state['today']['min_battery_voltage'] < 999 else 0.0,
+                    "max_battery_current": self.state['today']['max_battery_current'],
                     "time_bulk": int(self.t_bulk_ms / (1000 * 60)),
                     "time_absorption": self.dbus['/History/Daily/0/TimeInAbsorption'],
                     "time_float": self.dbus['/History/Daily/0/TimeInFloat'],
@@ -404,7 +494,7 @@ class TriStarDriver:
                 self.last_reset_date = current_date
                 self.state['current_date'] = current_date
 
-                # Reset daily trackers for new day
+                # Reset daily trackers for new day (both memory and state)
                 self.daily_max_battery_current = 0.0
                 self.daily_max_power = 0.0
                 self.daily_max_battery_voltage = 0.0
@@ -412,11 +502,25 @@ class TriStarDriver:
                 self.daily_max_pv_voltage = 0.0
                 self.t_bulk_ms = 0
 
+                # Reset today's values in state as well
+                self.state['today'] = {
+                    "max_battery_current": 0.0,
+                    "max_power": 0.0,
+                    "max_pv_voltage": 0.0,
+                    "max_battery_voltage": 0.0,
+                    "min_battery_voltage": 999.0,
+                    "time_bulk": 0
+                }
+
                 # Reset register flag (expect register to reset when sun comes up)
                 self.daily_register_has_reset = False
+                self.state['daily_register_has_reset'] = False
 
                 # Save state to file
                 self._save_state()
+
+                # Update D-Bus paths immediately for days 1-29 (show rotated history in UI)
+                self._update_historical_days()
 
                 logging.info(f"History rotated. Now have {len(self.state['history'])} days of history")
 
@@ -462,6 +566,16 @@ class TriStarDriver:
 
         # History
         s.add_path('/History/Overall/DaysAvailable', 1)
+
+        # History - Overall (lifetime) - Values updated from state in update loop
+        s.add_path('/History/Overall/MaxPvVoltage', 0.0, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/History/Overall/MaxBatteryVoltage', 0.0, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/History/Overall/MinBatteryVoltage', 0.0, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/History/Overall/LastError1', 0)  # Error history not yet implemented
+        s.add_path('/History/Overall/LastError2', 0)
+        s.add_path('/History/Overall/LastError3', 0)
+        s.add_path('/History/Overall/LastError4', 0)
+
         # History - Day 0 (today, live values) - always created
         s.add_path('/History/Daily/0/Yield', 0.0, gettextcallback=lambda p, v: f"{v}kWh")
         s.add_path('/History/Daily/0/MaxPower', 0, gettextcallback=lambda p, v: f"{v}W")
@@ -586,6 +700,17 @@ class TriStarDriver:
             # Force re-initialization with new settings
             logging.info("Connection settings changed - will re-initialize on next update")
             self.initialized = False
+        elif setting == 'state_save_interval':
+            # Update state save interval
+            self.state_save_interval = new
+            logging.info(f"State save interval updated to {new} seconds")
+        elif setting == 'watchdog_timeout':
+            # Update watchdog timeout
+            self.watchdog_timeout = new
+            logging.info(f"Watchdog timeout updated to {new} seconds")
+        elif setting == 'nightly_reset_hour':
+            # Update nightly reset hour (will take effect at next reset check)
+            logging.info(f"Nightly reset hour updated to {new} (effective at next reset check)")
 
     def _on_coil_write(self, path, value):
         """Called when a coil control is written via D-Bus"""
@@ -983,11 +1108,9 @@ class TriStarDriver:
             cs_raw = reg(REG_CHARGE_STATE)
             cs = CHARGE_STATE_MAP.get(cs_raw, 0)
 
-            # Calculate bulk time
+            # Calculate bulk time (only increment during BULK, reset happens at midnight)
             if cs_raw == CS_BULK:
                 self.t_bulk_ms += dt_ms
-            elif cs_raw == CS_NIGHT:
-                self.t_bulk_ms = 0
 
             # Update D-Bus
             self.dbus['/Pv/V'] = round(v_pv, 2)
@@ -1082,6 +1205,31 @@ class TriStarDriver:
                 self.daily_min_battery_voltage = min(self.daily_min_battery_voltage, v_bat)
             self.daily_max_pv_voltage = max(self.daily_max_pv_voltage, v_pv)
 
+            # Update lifetime max/min from current values (saved once per day at midnight)
+            self.state['lifetime']['max_pv_voltage'] = max(self.state['lifetime']['max_pv_voltage'], v_pv)
+            self.state['lifetime']['max_battery_voltage'] = max(self.state['lifetime']['max_battery_voltage'], v_bat)
+            if v_bat > 0:
+                self.state['lifetime']['min_battery_voltage'] = min(self.state['lifetime']['min_battery_voltage'], v_bat)
+
+            # Also update lifetime AND today based on TriStar's min/max (when data is valid)
+            # TriStar tracks continuously, so it may have seen values we missed
+            if self.daily_register_has_reset:
+                today_max_pv_raw = reg(REG_V_PV_MAX) * self.v_pu / 32768.0
+                today_max_batt_raw = reg(REG_V_BAT_MAX) * self.v_pu / 32768.0
+                today_min_batt_raw = reg(REG_V_BAT_MIN) * self.v_pu / 32768.0
+
+                # Update lifetime
+                self.state['lifetime']['max_pv_voltage'] = max(self.state['lifetime']['max_pv_voltage'], today_max_pv_raw)
+                self.state['lifetime']['max_battery_voltage'] = max(self.state['lifetime']['max_battery_voltage'], today_max_batt_raw)
+                if today_min_batt_raw > 0:
+                    self.state['lifetime']['min_battery_voltage'] = min(self.state['lifetime']['min_battery_voltage'], today_min_batt_raw)
+
+                # Also update today's values from TriStar (more accurate than our 5-sec sampling)
+                self.state['today']['max_pv_voltage'] = max(self.state['today']['max_pv_voltage'], today_max_pv_raw)
+                self.state['today']['max_battery_voltage'] = max(self.state['today']['max_battery_voltage'], today_max_batt_raw)
+                if today_min_batt_raw > 0 and today_min_batt_raw < 999:
+                    self.state['today']['min_battery_voltage'] = min(self.state['today']['min_battery_voltage'], today_min_batt_raw)
+
             # Calculate daily yield with register reset detection
             # (used for history, yield calculation, and midnight rollover)
             current_daily_wh = reg(REG_WHC_DAILY)
@@ -1089,13 +1237,21 @@ class TriStarDriver:
             # Detect register reset (value decreased = sun came up and register reset)
             if current_daily_wh < self.last_daily_register_value:
                 self.daily_register_has_reset = True
+                self.state['daily_register_has_reset'] = True
                 logging.info(f"Detected REG_WHC_DAILY reset: {self.last_daily_register_value} → {current_daily_wh} Wh (sun came up)")
 
-            # On first update, infer reset state from charge state
+            # On first update after restart: Use TriStar's ACTUAL charge state (not Victron mapped)
+            # TriStar charge state >= 5 means charging (MPPT/Bulk or higher)
             if self.last_daily_register_value == 0:  # First update
-                if cs >= 3:  # Bulk, Absorption, Float, Equalize (actively charging)
+                if cs_raw >= 5:
+                    # TriStar is charging → sun is up → Modbus registers are valid
                     self.daily_register_has_reset = True
-                    logging.info("First update while charging - assuming register has reset")
+                    self.state['daily_register_has_reset'] = True
+                    logging.info(f"First update: TriStar charging (cs_raw={cs_raw}) - Modbus valid")
+                else:
+                    # Not charging → use daily_register_has_reset from state.json (persists from before restart)
+                    # This way: restart before midnight = True (Modbus valid), restart after midnight = False (Modbus stale)
+                    logging.info(f"First update: not charging (cs_raw={cs_raw}) - using daily_register_has_reset={self.daily_register_has_reset} from state")
 
             self.last_daily_register_value = current_daily_wh
 
@@ -1109,21 +1265,20 @@ class TriStarDriver:
             # Check for midnight (date changed) - do this BEFORE updating history paths
             self._check_midnight_rollover(daily_kwh)
 
+            # Update state['today'] with current daily values (AFTER midnight check, so reset works correctly)
+            # This will be saved every 5 minutes to preserve values across restarts
+            self.state['today']['max_battery_current'] = self.daily_max_battery_current
+            self.state['today']['max_power'] = self.daily_max_power
+            self.state['today']['max_pv_voltage'] = self.daily_max_pv_voltage
+            self.state['today']['max_battery_voltage'] = self.daily_max_battery_voltage
+            self.state['today']['min_battery_voltage'] = self.daily_min_battery_voltage
+            self.state['today']['time_bulk'] = int(self.t_bulk_ms / (1000 * 60))  # Convert ms to minutes
+
             # History - Day 0 (today, live values)
-            # Use 0 for all values if post-midnight but register hasn't reset yet
             self.dbus['/History/Daily/0/Yield'] = round(daily_kwh, 2)
 
-            if not self.daily_register_has_reset:
-                # Post-midnight, pre-sunrise: use 0 for all daily register values
-                self.dbus['/History/Daily/0/MaxPower'] = 0
-                self.dbus['/History/Daily/0/MaxPvVoltage'] = 0.0
-                self.dbus['/History/Daily/0/MaxBatteryVoltage'] = 0.0
-                self.dbus['/History/Daily/0/MinBatteryVoltage'] = 0.0
-                self.dbus['/History/Daily/0/TimeInAbsorption'] = 0
-                self.dbus['/History/Daily/0/TimeInFloat'] = 0
-                self.dbus['/History/Daily/0/TimeInEqualize'] = 0
-            else:
-                # Register has reset: use actual values from Modbus
+            if self.daily_register_has_reset:
+                # Register has valid data for today - use Modbus values
                 self.dbus['/History/Daily/0/MaxPower'] = round(
                     reg(REG_POUT_MAX_DAILY) * self.i_pu * self.v_pu / 131072.0, 0
                 )
@@ -1139,6 +1294,18 @@ class TriStarDriver:
                 self.dbus['/History/Daily/0/TimeInAbsorption'] = reg(REG_T_ABS) // 60
                 self.dbus['/History/Daily/0/TimeInFloat'] = reg(REG_T_FLOAT) // 60
                 self.dbus['/History/Daily/0/TimeInEqualize'] = reg(REG_T_EQ_DAILY) // 60
+            else:
+                # Modbus has stale data - use today's values from state.json instead
+                # (state is updated every 5 min, so these are recent values)
+                self.dbus['/History/Daily/0/MaxPower'] = round(self.state['today']['max_power'], 0)
+                self.dbus['/History/Daily/0/MaxPvVoltage'] = round(self.state['today']['max_pv_voltage'], 2)
+                self.dbus['/History/Daily/0/MaxBatteryVoltage'] = round(self.state['today']['max_battery_voltage'], 2)
+                min_batt = self.state['today']['min_battery_voltage']
+                self.dbus['/History/Daily/0/MinBatteryVoltage'] = round(min_batt, 2) if min_batt < 999 else 0.0
+                # Time values: Set to 0 when Modbus is stale (post-midnight, pre-sunrise)
+                self.dbus['/History/Daily/0/TimeInAbsorption'] = 0
+                self.dbus['/History/Daily/0/TimeInFloat'] = 0
+                self.dbus['/History/Daily/0/TimeInEqualize'] = 0
 
             # These values are tracked by us (reset at midnight), so always use them
             self.dbus['/History/Daily/0/MaxBatteryCurrent'] = round(self.daily_max_battery_current, 2)
@@ -1147,14 +1314,27 @@ class TriStarDriver:
             # Update historical days 1-29 from state file
             self._update_historical_days()
 
+            # Update Overall (lifetime) values
+            self.dbus['/History/Overall/MaxPvVoltage'] = round(self.state['lifetime']['max_pv_voltage'], 2)
+            self.dbus['/History/Overall/MaxBatteryVoltage'] = round(self.state['lifetime']['max_battery_voltage'], 2)
+            min_batt = self.state['lifetime']['min_battery_voltage']
+            self.dbus['/History/Overall/MinBatteryVoltage'] = round(min_batt, 2) if min_batt < 999 else 0.0
+
+            # Periodic state save (every 5 minutes to preserve today's values across restarts)
+            current_time = time()
+            if current_time - self.last_state_save_time >= self.state_save_interval:
+                logging.info(f"Periodic state save (5 min interval) - preserving today's values")
+                self._save_state()
+                self.last_state_save_time = current_time
+
             # Total yield (use persistent counter to avoid double-counting)
-            # Initialize total_yield_kwh from controller on first run
+            # Do NOT auto-initialize from TriStar registers (they may be reset or have wrong baseline)
+            # User must manually set total_yield_kwh in state.json to desired starting value
             if self.state['total_yield_kwh'] == 0.0:
-                lifetime_kwh = reg(REG_KWH_TOTAL_RES)
-                if lifetime_kwh > 0:
-                    logging.info(f"Initializing total_yield_kwh from controller: {lifetime_kwh} kWh")
-                    self.state['total_yield_kwh'] = float(lifetime_kwh)
-                    self._save_state()
+                logging.warning("total_yield_kwh is 0! Please manually set it in state.json to your desired baseline.")
+                logging.warning(f"  REG_KWH_TOTAL_RES (resettable) = {reg(REG_KWH_TOTAL_RES)} kWh")
+                logging.warning(f"  REG_KWH_TOTAL (permanent) = {reg(REG_KWH_TOTAL)} kWh")
+                logging.warning("  Edit /data/dbus-tristar/state.json and set 'total_yield_kwh' to correct value.")
 
             # Total yield: persistent total + today's calculated yield (already handled above)
             self.dbus['/Yield/User'] = round(self.state['total_yield_kwh'] + daily_kwh, 2)
@@ -1177,23 +1357,45 @@ class TriStarDriver:
         return True  # Continue timer
 
     def _check_nightly_reset(self):
-        """Check if we should perform nightly comm server reset at 03:00"""
-        now = datetime.now()
-        current_date = now.date()
-        current_hour = now.hour
-        current_minute = now.minute
+        """Check if we should perform nightly TriStar comm server reset (local time)"""
+        # Get current local date and time (same method as midnight detection)
+        current_date = self._get_local_date()
 
-        # Check if it's 03:00-03:04 (5-minute window to catch it)
-        if current_hour == 3 and current_minute < 5:
+        # Get current local hour/minute
+        try:
+            bus = dbus.SystemBus()
+            settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
+            tz_string = settings.GetValue()
+
+            old_tz = os.environ.get('TZ', '')
+            os.environ['TZ'] = tz_string
+            time_module.tzset()
+
+            current_hour = int(time_module.strftime('%H', time_module.localtime()))
+            current_minute = int(time_module.strftime('%M', time_module.localtime()))
+
+            # Restore TZ
+            if old_tz:
+                os.environ['TZ'] = old_tz
+            else:
+                if 'TZ' in os.environ:
+                    del os.environ['TZ']
+            time_module.tzset()
+
+        except Exception as e:
+            logging.error(f"Error getting local time for nightly reset: {e}")
+            return
+
+        reset_hour = self.settings['nightly_reset_hour']
+
+        # Check if it's reset time (5-minute window to catch it)
+        if current_hour == reset_hour and current_minute < 5:
             # Only attempt reset once per day
             if self.last_reset_date != current_date:
                 # Mark as attempted BEFORE trying (prevent retry spam if write fails)
                 self.last_reset_date = current_date
 
-                logging.info("Performing nightly comm server reset and daily counters reset at 03:00")
-
-                # Reset daily counters
-                self.t_bulk_ms = 0
+                logging.info(f"Performing nightly TriStar comm server reset at {reset_hour:02d}:00 local time")
 
                 # Reset comm server
                 success = self.write_coil(COIL_RESET_COMM, True)

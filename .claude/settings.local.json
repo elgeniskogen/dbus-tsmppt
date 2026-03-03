@@ -11,7 +11,8 @@
       "WebFetch(domain:community.victronenergy.com)",
       "WebFetch(domain:communityarchive.victronenergy.com)",
       "WebFetch(domain:mr-manuel.github.io)",
-      "Bash(scp /Users/erik/Documents/Dev/venus/dbus-tsmppt/dbus_tristar.py root@192.168.2.102:/data/dbus-tristar/)"
+      "Bash(scp /Users/erik/Documents/Dev/venus/dbus-tsmppt/dbus_tristar.py root@192.168.2.102:/data/dbus-tristar/)",
+      "Bash(sshpass -p 'Pelle1970' ssh root@192.168.2.102 \"dbus -y com.victronenergy.solarcharger.tristar_0 /Mgmt/ProcessVersion GetValue\")"
     ],
     "deny": [],
     "ask": []
