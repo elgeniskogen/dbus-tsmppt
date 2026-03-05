@@ -16,6 +16,12 @@ TO DO:
 * Check time used for restrart and for resetting counters: local time vs UTC
 * Check modbus parameters to be used for I and V. Now it is a mix of fast and slow. 
 * Make filters similar to those in the templates in HS
+* Make top charging mechanism with custom time on max voltage.
+* Make a system for indicating if excess power is available using Sweep Pmax and Output Power
+* Make switches/control in Venus for top chariging and time at max voltage
+* Make temp sensor for battery in Venus
+* Make top charging algorithm looking at tail current and time in max voltage
+
 ---
 
 ## Quick Start
