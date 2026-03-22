@@ -7,20 +7,19 @@
 ✅ **No QML required** - Configure via D-Bus command line
 ✅ **100% compatible** - Same data as original C++ driver
 ✅ **WAN-ready** - Works over internet with optimized timeouts
+✅ **Advanced features** - Voltage override, tail current detection, 30-day history
 
-TO DO:
-* Make a path with the Tristar charger states, both number and text (ca_raw in code)
-* Add fields to comply with VRM Installation data: 
-* CHeck is regulation voltage is available on dbus
-* Check that comm restart is actually working
-* Check time used for restrart and for resetting counters: local time vs UTC
-* Check modbus parameters to be used for I and V. Now it is a mix of fast and slow. 
-* Make filters similar to those in the templates in HS
-* Make top charging mechanism with custom time on max voltage.
-* Make a system for indicating if excess power is available using Sweep Pmax and Output Power
-* Make switches/control in Venus for top chariging and time at max voltage
-* Make temp sensor for battery in Venus
-* Make top charging algorithm looking at tail current and time in max voltage
+📚 **[Complete Documentation](DRIVER_DOCUMENTATION.md)** - All D-Bus paths, logic, and advanced features
+
+---
+
+## Recent Updates (v2.24)
+
+✅ **Voltage Override System** - Battery top-charging with automatic tail current detection
+✅ **Cumulative Time Tracking** - Tolerates brief voltage dips (Home Assistant pattern)
+✅ **Nightly Reset** - Prevents stuck charging sessions (configurable hour)
+✅ **30-Day History** - Daily max/min tracking with state persistence
+✅ **EEPROM Counters** - Lifetime kWh from TriStar's internal registers
 
 ---
 
@@ -63,6 +62,44 @@ svc -t /service/dbus-tristar
 
 ---
 
+## Battery Top-Charging (Quick Example)
+
+The driver supports advanced battery top-charging with automatic tail current detection:
+
+```bash
+# Enable voltage override to 28.7V for top-charging
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/VoltageOverride SetValue 28.7
+
+# Monitor progress
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/TimeAtTargetVoltage GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/TailCurrentTimer GetValue
+
+# Check status
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/Active GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/StopReason GetValue
+
+# Disable when done (or let automatic tail current detection stop it)
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/VoltageOverride SetValue 0
+```
+
+**Automatic stopping conditions:**
+- Battery full (tail current < 2.0A for 5 minutes)
+- Time limit reached (max 2 hours/day)
+- Nightly reset (03:00 local time)
+
+**Configure thresholds:**
+```bash
+# Set tail current threshold to 1.5A
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/BatteryFullCurrent SetValue 1.5
+
+# Set max voltage to 28.95V
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/MaxVoltageOverrideVoltage SetValue 28.95
+```
+
+📚 **Full documentation:** [DRIVER_DOCUMENTATION.md](DRIVER_DOCUMENTATION.md) - Complete guide with all settings, D-Bus paths, and logic
+
+---
+
 ## Verification
 
 ```bash
@@ -98,11 +135,14 @@ Your TriStar MPPT will appear as a **Solar Charger** in:
 - ✅ Full VRM Portal integration
 
 ### Control
+- ✅ **Voltage override** - Top-charge to configurable voltage (e.g., 28.7V)
+- ✅ **Automatic battery full detection** - Tail current monitoring with configurable thresholds
+- ✅ **Mode control** - Enable/disable charging via D-Bus
 - ✅ Equalize trigger (read/write coil with verification)
 - ✅ Charger disconnect (read/write coil with verification)
 - ✅ Controller reset (momentary button)
 - ✅ Comm server reset (momentary button)
-- ✅ **Automatic nightly reset at 03:00** (comm server + daily counters)
+- ✅ **Automatic nightly reset** at configurable hour (default: 03:00)
 
 ### Diagnostics & Health Monitoring
 - ✅ **Connection statistics** (/Custom/Stats/SuccessfulReads)
@@ -143,9 +183,10 @@ Your TriStar MPPT will appear as a **Solar Charger** in:
 
 ```
 dbus-tsmppt/
-├── dbus_tristar.py              # Main driver
+├── dbus_tristar.py              # Main driver (v2.24)
 ├── install.sh                   # Installation script
-├── README.md                    # This file (main documentation)
+├── README.md                    # This file (overview)
+├── DRIVER_DOCUMENTATION.md      # Complete technical reference (📚 READ THIS!)
 ├── QUICKSTART.md                # Quick start guide
 ├── test_connection.py           # Connection testing tool
 ├── dbus_tristar_mock.py         # Mock driver for testing
@@ -157,9 +198,10 @@ dbus-tsmppt/
 
 ## Documentation
 
+- **[DRIVER_DOCUMENTATION.md](DRIVER_DOCUMENTATION.md)** - 📚 **COMPLETE REFERENCE** - All D-Bus paths, voltage override system, tail current detection, settings, troubleshooting
 - **[QUICKSTART.md](QUICKSTART.md)** - 3-minute installation guide
 - **[test_connection.py](test_connection.py)** - Test Modbus connection to your TriStar
-- **[docs/TECHNICAL-DETAILS.md](docs/TECHNICAL-DETAILS.md)** - Complete technical details and C++ compatibility analysis
+- **[docs/TECHNICAL-DETAILS.md](docs/TECHNICAL-DETAILS.md)** - C++ compatibility analysis and technical details
 
 ---
 
@@ -226,30 +268,20 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Stats/LastSuccessTime G
 ## Technical Details
 
 **Architecture:**
-- Uses Venus OS `SettingsDevice` API (array format for v3.67)
-- Connect-read-close Modbus pattern (matches TriStar hardware behavior)
+- Pure Python using Venus OS `SettingsDevice` API
+- Connect-read-close Modbus pattern (matches TriStar hardware)
 - pymodbus v2.x/v3.x compatible with auto-detection
-- GLib main loop with configurable timer and exponential backoff
-- Full error handling with 5 retries per operation
-- Connection watchdog (3-minute timeout)
-- Graceful shutdown (SIGTERM/SIGINT handlers)
-
-**WAN Optimizations:**
-- 1-second Modbus timeout (down from 20s in C++ driver)
-- Exponential backoff on persistent failures (1x → 2x → 4x interval)
-- Data validation with sanity checks (voltage/current/power ranges)
-- Critical coil verification (read-after-write for EQUALIZE/DISCONNECT)
-- Smart retry logging (DEBUG for transient, ERROR for persistent)
+- GLib main loop with exponential backoff on failures
+- WAN-optimized: 1-second timeout, data validation, smart retry logging
 
 **D-Bus Service:**
 - Service name: `com.victronenergy.solarcharger.tristar_{instance}` (configurable)
-- 27 standard D-Bus paths identical to original C++ driver
-- 5 new statistics paths for diagnostics (/Custom/Stats/*)
-- Charge state mapping: TriStar states → Victron states
-- Proper signed/unsigned conversion and scaling
-- All 4 control coils exposed (equalize, disconnect, reset controller, reset comm)
+- 50+ D-Bus paths: Standard Victron + Custom monitoring/control
+- Full settings integration: `/Settings/TristarMPPT/*`
+- State persistence: 30-day history in `/data/dbus-tristar/state.json`
 
-**See [docs/TECHNICAL-DETAILS.md](docs/TECHNICAL-DETAILS.md) for complete technical details and C++ compatibility analysis.**
+**For complete technical details, D-Bus path reference, Modbus registers, and troubleshooting:**
+📚 **See [DRIVER_DOCUMENTATION.md](DRIVER_DOCUMENTATION.md)**
 
 ---
 
@@ -335,6 +367,7 @@ MIT License - See [LICENSE](LICENSE)
 - **Original C++ driver:** Ole André Sæther (2018-2019)
 - **Python rewrite:** 2024 - Modern Venus OS v3.4+ compatible
 - **Architecture:** Based on Victron Energy Venus OS and velib_python
+- https://github.com/mr-manuel/venus-os_dbus-mqtt-solar-charger
 
 ---
 

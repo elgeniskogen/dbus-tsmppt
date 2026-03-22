@@ -52,6 +52,13 @@ CONFIG = {
     'watchdog_timeout_sec': 180,       # Mark disconnected after 3 min without Modbus
     'nightly_reset_hour': 3,           # TriStar comm reset at 03:00 local time
 
+    # Voltage override settings
+    'excess_power_threshold': 100,          # Watts - minimum excess before override considered
+    'max_voltage_override_voltage': 28.7,   # Volts - SAFETY LIMIT (driver never exceeds this)
+    'max_voltage_override_time': 7200,      # Seconds/day - max time at override voltage (2 hours)
+    'battery_full_current': 2.0,            # Amps - tail current threshold for full detection
+    'tail_current_time': 300,               # Seconds - sustained tail current time (5 min)
+
     # Device identification
     'custom_name': 'TriStar MPPT 60',
 }
@@ -134,7 +141,7 @@ CHARGE_STATE_MAP = {
     6: 4,   # ABSORPTION -> ABSORPTION
     7: 5,   # FLOAT -> FLOAT
     8: 7,   # EQUALIZE -> EQUALIZE
-    9: 11   # SLAVE -> OTHER
+    9: 4    # SLAVE -> ABSORPTION (actively regulating to target voltage)
 }
 
 # TriStar charge state text (raw TriStar values)
@@ -201,6 +208,11 @@ class TriStarDriver:
                 'state_save_interval': ['/Settings/TristarMPPT/StateSaveInterval', CONFIG['state_save_interval_sec'], 60, 3600],
                 'watchdog_timeout': ['/Settings/TristarMPPT/WatchdogTimeout', CONFIG['watchdog_timeout_sec'], 30, 600],
                 'nightly_reset_hour': ['/Settings/TristarMPPT/NightlyResetHour', CONFIG['nightly_reset_hour'], 0, 23],
+                'excess_power_threshold': ['/Settings/TristarMPPT/ExcessPowerThreshold', CONFIG['excess_power_threshold'], -1, 5000],
+                'max_voltage_override_voltage': ['/Settings/TristarMPPT/MaxVoltageOverrideVoltage', CONFIG['max_voltage_override_voltage'], 24.0, 32.0],
+                'max_voltage_override_time': ['/Settings/TristarMPPT/MaxVoltageOverrideTime', CONFIG['max_voltage_override_time'], 0, 86400],
+                'battery_full_current': ['/Settings/TristarMPPT/BatteryFullCurrent', CONFIG['battery_full_current'], 0.0, 100.0],
+                'tail_current_time': ['/Settings/TristarMPPT/TailCurrentTime', CONFIG['tail_current_time'], 0, 3600],
             },
             eventCallback=self._setting_changed
         )
@@ -237,6 +249,27 @@ class TriStarDriver:
 
         # Exponential backoff on persistent failures
         self.backoff_factor = 1  # Multiplier for poll interval (1x, 2x, 4x)
+
+        # Voltage override control
+        self.pending_voltage_override = None       # Register value to write (None = disabled)
+        self.last_voltage_override_write = 0       # Timestamp of last write
+        self.voltage_override_interval = 30        # Write every 30 seconds
+        self.voltage_override_active = False       # Is override currently active?
+
+        # Time tracking for voltage override
+        self.time_at_override_today = 0            # Accumulated seconds at override today (deprecated)
+        self.time_above_target_accumulated = 0     # Cumulative seconds at or above target voltage
+        self.last_override_time_update = 0         # Timestamp for delta calculation
+        self.override_start_time = None            # When battery first reached target voltage
+
+        # Tail current detection
+        self.tail_current_start_time = None        # When tail current condition started
+        self.stop_reason = ""                      # Why override stopped
+
+        # Current override control (PDU register 88 - Ib_ref_slave, Logical 89)
+        self.pending_current_override = None       # Register value to write (None = disabled)
+        self.last_current_override_write = 0       # Timestamp of last write
+        self.current_override_active = False       # Is current override active?
 
         # Load persistent state (total yield and 30-day history)
         self.state = self._load_state()
@@ -278,6 +311,19 @@ class TriStarDriver:
         # Load from state (persists across restarts to know if Modbus is valid)
         self.daily_register_has_reset = self.state.get('daily_register_has_reset', True)
         self.last_daily_register_value = 0
+        self.first_update_done = False  # Flag to detect very first update after restart
+
+        # Load voltage override state (for backwards compatibility)
+        if 'voltage_override' not in self.state:
+            self.state['voltage_override'] = {
+                "time_used_today": 0,
+                "current_date": self.state.get('current_date'),
+                "stop_reason": ""
+            }
+
+        # Load voltage override time tracking from state
+        self.time_at_override_today = self.state['voltage_override'].get('time_used_today', 0)
+        self.stop_reason = self.state['voltage_override'].get('stop_reason', "")
 
         # Track which history days have D-Bus paths created (for dynamic path creation)
         self.history_days_created = set()  # Set of day indices (1-29) that have paths
@@ -344,6 +390,11 @@ class TriStarDriver:
                 "max_pv_voltage": 0.0,
                 "max_battery_voltage": 0.0,
                 "min_battery_voltage": 999.0  # High initial value so first real value will be lower
+            },
+            "voltage_override": {
+                "time_used_today": 0,         # Seconds at override voltage today
+                "current_date": self._get_local_date(),  # Date for midnight reset
+                "stop_reason": ""             # Last stop reason
             }
         }
 
@@ -354,7 +405,7 @@ class TriStarDriver:
             STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
             # Update timestamp
-            self.state['last_update'] = datetime.utcnow().isoformat() + "Z"
+            self.state['last_update'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
             # Write atomically (temp file + rename)
             temp_file = STATE_FILE.with_suffix('.tmp')
@@ -516,6 +567,12 @@ class TriStarDriver:
                 self.daily_register_has_reset = False
                 self.state['daily_register_has_reset'] = False
 
+                # Reset voltage override time tracking for new day
+                self.time_at_override_today = 0
+                self.state['voltage_override']['time_used_today'] = 0
+                self.state['voltage_override']['current_date'] = current_date
+                logging.info("Voltage override time counter reset for new day")
+
                 # Save state to file
                 self._save_state()
 
@@ -544,7 +601,7 @@ class TriStarDriver:
         s.add_path('/Serial', '')
         s.add_path('/DeviceInstance', int(self.settings['device_instance']))
         s.add_path('/Connected', 0)
-        s.add_path('/Mode', 1)
+        s.add_path('/Mode', 1, writeable=True, onchangecallback=self._on_mode_change)  # 1=On, 4=Off
         s.add_path('/ErrorCode', 0)
 
         # Number of trackers (TriStar MPPT 60 is single-tracker)
@@ -601,6 +658,9 @@ class TriStarDriver:
         s.add_path('/Control/ResetController', 0, writeable=True, onchangecallback=self._on_coil_write)
         s.add_path('/Control/ResetCommServer', 0, writeable=True, onchangecallback=self._on_coil_write)
 
+        # Voltage override control - writable (non-persistent, starts at 0)
+        s.add_path('/Control/VoltageOverride', 0.0, writeable=True, onchangecallback=self._on_voltage_override_write, gettextcallback=lambda p, v: f"{v}V")
+
         # Statistics for diagnostics and health monitoring
         s.add_path('/Custom/Stats/SuccessfulReads', 0, writeable=False)
         s.add_path('/Custom/Stats/FailedReads', 0, writeable=False)
@@ -613,11 +673,40 @@ class TriStarDriver:
         s.add_path('/Custom/ChargeStateText', None, writeable=False)  # Text representation
         s.add_path('/Custom/TargetRegulationVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")  # Target regulation voltage
 
+        # Voltage override monitoring
+        s.add_path('/Custom/VoltageOverride/ExcessPower', 0, writeable=False, gettextcallback=lambda p, v: f"{v}W")
+        s.add_path('/Custom/VoltageOverride/Active', False, writeable=False)
+        s.add_path('/Custom/VoltageOverride/TimeAtTargetVoltage', 0, writeable=False)  # Seconds at target voltage
+        s.add_path('/Custom/VoltageOverride/TailCurrentTimer', 0, writeable=False)  # Seconds
+        s.add_path('/Custom/VoltageOverride/StopReason', "", writeable=False)  # Text: TimeLimit/BatteryFull/UserDisabled
+        s.add_path('/Custom/VoltageOverride/CurrentVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/Custom/VoltageOverride/RegisterReadback', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")  # Actual value read from PDU register 89 (vb_ref_slave)
+
+        # Current override control and monitoring (PDU register 88 - Ib_ref_slave, Logical 89)
+        s.add_path('/Control/CurrentOverride', 0.0, writeable=True, onchangecallback=self._on_current_override_write, gettextcallback=lambda p, v: f"{v}A")
+        s.add_path('/Custom/CurrentOverride/Active', False, writeable=False)
+        s.add_path('/Custom/CurrentOverride/CurrentValue', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}A")
+        s.add_path('/Custom/CurrentOverride/RegisterReadback', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}A")  # Actual value read from PDU register 88 (Ib_ref_slave)
+
+        # Manual control register monitoring (registers that might interfere with slave mode)
+        s.add_path('/Custom/ManualControl/VaRefFixed', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")  # Register 91 - Array voltage fixed target
+        s.add_path('/Custom/ManualControl/VaRefFixedPct', 0, writeable=False, gettextcallback=lambda p, v: f"{v}%")  # Register 92 - Array voltage % of Voc
+
         # Battery diagnostics
         s.add_path('/Custom/Battery/TerminalVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/Battery/SenseVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/Battery/CurrentFast', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}A")
         s.add_path('/Custom/Battery/VoltageSlow', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+
+        # EEPROM charge settings (configured absorption/equalize voltages and limits)
+        s.add_path('/Custom/EEPROM/AbsorptionVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/Custom/EEPROM/EqualizeVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/Custom/EEPROM/TempCompensation', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V/C")
+        s.add_path('/Custom/EEPROM/MaxRegulationLimit', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+
+        # EEPROM lifetime charge counters (TriStar's internal counters)
+        s.add_path('/Custom/EEPROM/ChargeKwhResetable', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}kWh")
+        s.add_path('/Custom/EEPROM/ChargeKwhTotal', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}kWh")
 
         # Internal power supply monitoring
         s.add_path('/Custom/InternalSupply/Rail12V', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
@@ -655,6 +744,7 @@ class TriStarDriver:
 
         # Daily history
         s.add_path('/Custom/Daily/ChargeAh', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}Ah")
+        s.add_path('/Custom/Daily/ChargeWh', 0, writeable=False, gettextcallback=lambda p, v: f"{v}Wh")  # Raw Modbus REG_WHC_DAILY
         s.add_path('/Custom/Daily/FlagsBitfield', None, writeable=False)
         s.add_path('/Custom/Daily/MinBatteryTemperature', 0.0, writeable=False)
         s.add_path('/Custom/Daily/MaxBatteryTemperature', 0.0, writeable=False)
@@ -712,6 +802,34 @@ class TriStarDriver:
             # Update nightly reset hour (will take effect at next reset check)
             logging.info(f"Nightly reset hour updated to {new} (effective at next reset check)")
 
+    def _on_mode_change(self, path, value):
+        """Called when /Mode is changed via D-Bus (1=On, 4=Off)"""
+        logging.info(f"Mode change request: {path} = {value}")
+
+        if value == 1:
+            # Mode = On → Clear COIL_DISCONNECT (allow charging)
+            logging.info("Setting charger to ON (clearing disconnect coil)")
+            success = self.write_coil(COIL_DISCONNECT, False)
+            if success:
+                self.dbus['/Mode'] = 1
+                logging.info("Charger enabled successfully")
+            else:
+                logging.error("Failed to enable charger")
+        elif value == 4:
+            # Mode = Off → Set COIL_DISCONNECT (force disconnect)
+            logging.info("Setting charger to OFF (setting disconnect coil)")
+            success = self.write_coil(COIL_DISCONNECT, True)
+            if success:
+                self.dbus['/Mode'] = 4
+                logging.info("Charger disabled successfully")
+            else:
+                logging.error("Failed to disable charger")
+        else:
+            logging.warning(f"Invalid mode value: {value} (expected 1 or 4)")
+            return value  # Return current value unchanged
+
+        return value
+
     def _on_coil_write(self, path, value):
         """Called when a coil control is written via D-Bus"""
         logging.info(f"Coil write request: {path} = {value}")
@@ -738,6 +856,161 @@ class TriStarDriver:
 
         # For stateful coils, keep the written value
         return value if success else not value
+
+    def _on_voltage_override_write(self, path, value):
+        """Called when voltage override is written via D-Bus"""
+        logging.info(f"Voltage override request: {path} = {value}")
+
+        try:
+            voltage = float(value)
+
+            # Disable override if negative value or zero
+            if voltage <= 0:
+                self.pending_voltage_override = None
+                self.voltage_override_active = False
+                self.stop_reason = "UserDisabled"
+                self.override_start_time = None
+                self.tail_current_start_time = None
+                self.time_above_target_accumulated = 0
+                logging.info("Voltage override disabled by user")
+                # Immediately write -1 to disable slave mode
+                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                # Also clear array voltage registers to ensure MPPT is enabled
+                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed
+                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct
+                # Update D-Bus paths immediately to show disabled
+                self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
+                self.dbus['/Custom/VoltageOverride/Active'] = False
+                self.dbus['/Custom/CurrentOverride/CurrentValue'] = 0.0
+                self.dbus['/Custom/CurrentOverride/Active'] = False
+                return -1  # Show -1 on D-Bus path to indicate disabled
+
+            # Validate against safety limit (CRITICAL)
+            max_voltage = self.settings['max_voltage_override_voltage']
+            if voltage > max_voltage:
+                logging.error(f"Voltage override REJECTED: {voltage}V > max {max_voltage}V (safety limit)")
+                return False  # Reject write
+
+            # Convert voltage to register format
+            register_value = self.voltage_to_register(voltage)
+            self.pending_voltage_override = register_value
+            self.voltage_override_active = True
+
+            # Write voltage override to PDU 89 only (current override not needed for slave mode)
+            success = self.write_holding_register(89, register_value)  # PDU 89 = vb_ref_slave
+            if success:
+                self.last_voltage_override_write = time()  # Reset timer for next periodic write (30s from now)
+                # Update D-Bus paths immediately
+                actual_voltage = self.register_to_voltage(register_value)
+                self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = round(actual_voltage, 2)
+                self.dbus['/Custom/VoltageOverride/Active'] = True
+
+                # Read back PDU 89 to verify write
+                sleep(0.1)  # Give TriStar time to process
+                readback = self.read_holding_registers(89, 1)  # PDU 89 = vb_ref_slave
+                if readback is not None:
+                    readback_value = self._to_signed(readback[0])
+                    readback_voltage = self.register_to_voltage(readback_value)
+                    self.dbus['/Custom/VoltageOverride/RegisterReadback'] = round(readback_voltage, 2)
+                    if abs(readback_voltage - actual_voltage) > 0.1:
+                        logging.warning(f"PDU 89 readback mismatch: wrote {actual_voltage:.2f}V, read {readback_voltage:.2f}V (reg: {readback_value})")
+                    else:
+                        logging.info(f"PDU 89 verified: {readback_voltage:.2f}V (reg: {readback_value})")
+                else:
+                    logging.warning("Failed to read back PDU 89")
+
+            # Clear stop reason when user enables
+            self.stop_reason = ""
+
+            # Return actual voltage that will be written (may differ slightly due to scaling)
+            actual_voltage = self.register_to_voltage(register_value)
+            logging.info(f"Voltage override set to {voltage}V (actual: {actual_voltage:.2f}V, register: {register_value})")
+            return round(actual_voltage, 2)
+
+        except (ValueError, TypeError) as e:
+            logging.error(f"Invalid voltage value: {e}")
+            return False
+
+    def _on_current_override_write(self, path, value):
+        """Called when current override is written via D-Bus"""
+        logging.info(f"Current override request: {path} = {value}")
+
+        try:
+            current = float(value)
+
+            # Disable override if negative value or zero
+            if current <= 0:
+                self.pending_current_override = None
+                self.current_override_active = False
+                logging.info("Current override disabled by user - also disabling voltage override (TriStar requires both)")
+                # Immediately write -1 to BOTH registers to disable slave mode
+                # (TriStar requires both registers to be maintained together)
+                self.write_holding_register(88, -1)  # PDU 88 = Ib_ref_slave
+                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                # Also clear array voltage registers to ensure MPPT is enabled
+                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed
+                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct
+                # Also disable voltage override
+                self.pending_voltage_override = None
+                self.voltage_override_active = False
+                # Update D-Bus paths immediately to show disabled
+                self.dbus['/Custom/CurrentOverride/CurrentValue'] = 0.0
+                self.dbus['/Custom/CurrentOverride/Active'] = False
+                self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
+                self.dbus['/Custom/VoltageOverride/Active'] = False
+                return -1  # Show -1 on D-Bus path to indicate disabled
+
+            # Convert current to register format
+            register_value = self.current_to_register(current)
+            self.pending_current_override = register_value
+            self.current_override_active = True
+
+            # CRITICAL: TriStar requires BOTH PDU 88 (current) AND 89 (voltage) to be updated
+            # together every <60s to maintain slave mode. Auto-enable voltage override with max safe limit.
+            if self.pending_voltage_override is None:
+                # Set voltage override to max safe voltage from settings
+                voltage_limit = self.settings['max_voltage_override_voltage']
+                voltage_register_value = self.voltage_to_register(voltage_limit)
+                self.pending_voltage_override = voltage_register_value
+                self.voltage_override_active = True
+                logging.info(f"Auto-enabling voltage override at {voltage_limit}V to maintain slave mode")
+                # Write voltage override immediately
+                self.write_holding_register(89, voltage_register_value)  # PDU 89 = vb_ref_slave
+                self.last_voltage_override_write = time()
+                self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = voltage_limit
+                self.dbus['/Custom/VoltageOverride/Active'] = True
+
+            # Immediately write to register (don't wait for periodic update)
+            success = self.write_holding_register(88, register_value)  # PDU 88 = Ib_ref_slave
+            if success:
+                self.last_current_override_write = time()  # Reset timer for next periodic write (30s from now)
+                # Update D-Bus paths immediately
+                actual_current = self.register_to_current(register_value)
+                self.dbus['/Custom/CurrentOverride/CurrentValue'] = round(actual_current, 2)
+                self.dbus['/Custom/CurrentOverride/Active'] = True
+
+                # Read back PDU 88 to verify write
+                sleep(0.1)  # Give TriStar time to process
+                readback = self.read_holding_registers(88, 1)  # PDU 88 = Ib_ref_slave
+                if readback is not None:
+                    readback_value = self._to_signed(readback[0])
+                    readback_current = self.register_to_current(readback_value)
+                    self.dbus['/Custom/CurrentOverride/RegisterReadback'] = round(readback_current, 2)
+                    if abs(readback_current - actual_current) > 0.5:
+                        logging.warning(f"PDU 88 readback mismatch: wrote {actual_current:.2f}A, read {readback_current:.2f}A (reg: {readback_value})")
+                    else:
+                        logging.info(f"PDU 88 verified: {readback_current:.2f}A (reg: {readback_value})")
+                else:
+                    logging.warning("Failed to read back PDU 88")
+
+            # Return actual current that will be written (may differ slightly due to scaling)
+            actual_current = self.register_to_current(register_value)
+            logging.info(f"Current override set to {current}A (actual: {actual_current:.2f}A, register: {register_value})")
+            return round(actual_current, 2)
+
+        except (ValueError, TypeError) as e:
+            logging.error(f"Invalid current value: {e}")
+            return False
 
     def read_input_registers(self, address, count):
         """
@@ -796,6 +1069,65 @@ class TriStarDriver:
                     logging.debug(f"Exception, retry {attempt + 1}/5: {e}")
                 else:
                     logging.error(f"Exception after 5 retries: {e}")
+
+                try:
+                    client.close()
+                except:
+                    pass
+
+                if attempt == 4:
+                    return None
+
+        return None
+
+    def read_holding_registers(self, address, count):
+        """
+        Read holding registers (writable registers like Vb_ref_slave)
+        Uses same pattern as read_input_registers: connect → read → close
+        """
+        ip = self.settings['ip_address']
+        port = self.settings['modbus_port']
+        slave_id = self.settings['slave_id']
+
+        for attempt in range(5):
+            client = ModbusTcpClient(host=ip, port=port, timeout=1, retries=0)
+
+            try:
+                if not client.connect():
+                    if attempt < 4:
+                        logging.debug(f"Connection failed, retry {attempt + 1}/5")
+                        continue
+                    else:
+                        logging.error(f"Failed to connect for holding register read after 5 retries")
+                        return None
+
+                # Read holding registers
+                result = client.read_holding_registers(
+                    address=address,
+                    count=count,
+                    unit=slave_id
+                )
+
+                if result.isError():
+                    if attempt < 4:
+                        logging.debug(f"Modbus error reading holding register, retry {attempt + 1}/5")
+                        client.close()
+                        continue
+                    else:
+                        logging.error(f"Modbus error reading holding register after 5 retries")
+                        client.close()
+                        return None
+
+                # Success
+                registers = result.registers
+                client.close()
+                return registers
+
+            except Exception as e:
+                if attempt < 4:
+                    logging.debug(f"Exception reading holding register, retry {attempt + 1}/5: {e}")
+                else:
+                    logging.error(f"Exception reading holding register after 5 retries: {e}")
 
                 try:
                     client.close()
@@ -935,6 +1267,142 @@ class TriStarDriver:
 
         return False
 
+    def write_holding_register(self, address, value):
+        """
+        Write single holding register with retry logic
+
+        Args:
+            address: Register address (e.g., 90 for Vb_ref_slave)
+            value: 16-bit signed integer value (-32768 to 32767)
+
+        Returns:
+            True on success, False on failure
+        """
+        ip = self.settings['ip_address']
+        port = self.settings['modbus_port']
+        slave_id = self.settings['slave_id']
+
+        # Convert signed to unsigned for pymodbus (expects 0-65535)
+        # -1 becomes 65535 (0xFFFF) via two's complement
+        if value < 0:
+            unsigned_value = (1 << 16) + value  # 65536 + value
+        else:
+            unsigned_value = value
+
+        for attempt in range(5):
+            client = ModbusTcpClient(host=ip, port=port, timeout=1, retries=0)
+
+            try:
+                if not client.connect():
+                    if attempt < 4:
+                        logging.debug(f"Connection failed, retry {attempt + 1}/5")
+                        continue
+                    else:
+                        logging.error(f"Failed to connect for register {address} write after 5 retries")
+                        return False
+
+                result = client.write_register(address=address, value=unsigned_value, unit=slave_id)
+
+                if result.isError():
+                    if attempt < 4:
+                        client.close()
+                        continue
+                    else:
+                        logging.error(f"Register {address} write error after 5 retries")
+                        client.close()
+                        return False
+
+                client.close()
+                # Log register 90 (Vb_ref_slave) writes at INFO level for visibility
+                if address == 90:
+                    if value == -1 or unsigned_value >= 65535:
+                        logging.info(f"Successfully wrote register {address} = {value} (disable slave mode)")
+                    else:
+                        logging.info(f"Successfully wrote register {address} = {value} (enable slave mode)")
+                else:
+                    logging.debug(f"Successfully wrote register {address} = {value}")
+                return True
+
+            except Exception as e:
+                if attempt < 4:
+                    logging.debug(f"Exception on attempt {attempt + 1}: {e}")
+                    continue
+                else:
+                    logging.error(f"Exception writing register {address} after 5 retries: {e}")
+                    return False
+
+        return False
+
+    def voltage_to_register(self, voltage_v):
+        """
+        Convert real voltage (volts) to TriStar register format
+
+        Args:
+            voltage_v: Voltage in volts (e.g., 28.5)
+
+        Returns:
+            16-bit signed integer for Modbus register
+        """
+        if voltage_v < 0:  # Negative voltage disables override
+            return -1
+
+        # Apply v_pu scaling: register = voltage * 32768 / v_pu
+        register_value = int(voltage_v * 32768.0 / self.v_pu)
+
+        # Clamp to 16-bit signed range (-32768 to 32767)
+        register_value = max(-32768, min(32767, register_value))
+
+        return register_value
+
+    def register_to_voltage(self, register_value):
+        """
+        Convert register value back to voltage for verification
+
+        Args:
+            register_value: 16-bit signed integer from register
+
+        Returns:
+            Voltage in volts
+        """
+        if register_value < 0:
+            return 0
+        return register_value * self.v_pu / 32768.0
+
+    def current_to_register(self, current_a):
+        """
+        Convert real current (amps) to TriStar register format
+
+        Args:
+            current_a: Current in amps (e.g., 50.0)
+
+        Returns:
+            16-bit signed integer for Modbus register
+        """
+        if current_a < 0:  # Negative current disables override
+            return -1
+
+        # Apply i_pu scaling: register = current * 32768 / i_pu
+        register_value = int(current_a * 32768.0 / self.i_pu)
+
+        # Clamp to 16-bit signed range (-32768 to 32767)
+        register_value = max(-32768, min(32767, register_value))
+
+        return register_value
+
+    def register_to_current(self, register_value):
+        """
+        Convert register value back to current for verification
+
+        Args:
+            register_value: 16-bit signed integer from register
+
+        Returns:
+            Current in amps
+        """
+        if register_value < 0:
+            return 0
+        return register_value * self.i_pu / 32768.0
+
     def initialize(self):
         """Read static device information"""
         if self.initialized:
@@ -1005,7 +1473,17 @@ class TriStarDriver:
 
     def update(self):
         """Periodic update - read values and publish to D-Bus"""
-        logging.info("update() called")
+        # Only log if update is delayed (> 10 sec since last update)
+        current_time = time_module.time()
+        if hasattr(self, 'last_update_time'):
+            time_since_last = current_time - self.last_update_time
+            if time_since_last > 10:
+                logging.warning(f"update() delayed: {time_since_last:.1f}s since last update")
+        else:
+            logging.info("update() called (first time)")
+
+        self.last_update_time = current_time
+
         try:
             if not self.initialized:
                 logging.info("Not initialized, attempting to initialize...")
@@ -1123,8 +1601,10 @@ class TriStarDriver:
             # MppOperationMode: 0=Off, 1=V/I limited, 2=MPPT active
             if cs == 0 or cs == 2:
                 self.dbus['/MppOperationMode'] = 0  # Off or Fault
+            elif cs == 3:
+                self.dbus['/MppOperationMode'] = 2  # Bulk - MPPT tracking active
             else:
-                self.dbus['/MppOperationMode'] = 2  # MPPT tracking active
+                self.dbus['/MppOperationMode'] = 1  # Absorption/Float/Equalize - V/I limited
 
             # Custom TriStar-specific values
             self.dbus['/Custom/ChargeState'] = cs_raw
@@ -1136,6 +1616,31 @@ class TriStarDriver:
             self.dbus['/Custom/Battery/SenseVoltage'] = round(reg(REG_V_BAT_SENSE) * self.v_pu / 32768.0, 2)
             self.dbus['/Custom/Battery/CurrentFast'] = round(self._to_signed(reg(REG_I_CC_FAST)) * self.i_pu / 32768.0, 2)
             self.dbus['/Custom/Battery/VoltageSlow'] = round(reg(REG_V_BAT_SLOW) * self.v_pu / 32768.0, 2)
+
+            # EEPROM charge settings (to debug voltage override behavior)
+            # Read absorption voltage and regulation limits from EEPROM
+            eeprom_regs = self.read_input_registers(0xE000, 18)  # Read EV_absorp through Evb_ref_lim
+            if eeprom_regs and len(eeprom_regs) >= 18:
+                ev_absorp = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
+                ev_eq = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
+                ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C)
+                evb_ref_lim = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
+
+                self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = round(ev_absorp, 2)
+                self.dbus['/Custom/EEPROM/EqualizeVoltage'] = round(ev_eq, 2)
+                self.dbus['/Custom/EEPROM/TempCompensation'] = round(ev_tempcomp, 4)
+                self.dbus['/Custom/EEPROM/MaxRegulationLimit'] = round(evb_ref_lim, 2)
+
+            # EEPROM lifetime kWh counters (TriStar's internal accumulators)
+            # Read registers 0xE086-0xE087 (EkWhc_r and EkWhc_t)
+            kwh_regs = self.read_input_registers(0xE086, 2)
+            if kwh_regs and len(kwh_regs) >= 2:
+                # Spec page 15: kWhc registers already in kWh units (no scaling needed)
+                ekwhc_r = kwh_regs[0]  # 0xE086 - Resetable kWh
+                ekwhc_t = kwh_regs[1]  # 0xE087 - Total kWh (lifetime)
+
+                self.dbus['/Custom/EEPROM/ChargeKwhResetable'] = round(ekwhc_r, 1)
+                self.dbus['/Custom/EEPROM/ChargeKwhTotal'] = round(ekwhc_t, 1)
 
             # Internal power supply - use FIXED scaling constants per spec (NOT v_pu!)
             # Spec: MS-002582_v11.pdf, registers 31-35 use fixed voltage scaling
@@ -1234,24 +1739,37 @@ class TriStarDriver:
             # (used for history, yield calculation, and midnight rollover)
             current_daily_wh = reg(REG_WHC_DAILY)
 
-            # Detect register reset (value decreased = sun came up and register reset)
+            # Expose raw Modbus value on D-Bus for debugging/logging
+            self.dbus['/Custom/Daily/ChargeWh'] = current_daily_wh
+
+            # Detect register reset - TWO cases:
+            # 1. Value decreased (normal day: 690 → 10 Wh)
+            # 2. Increased from 0 (no charging yesterday: 0 → 10 Wh)
             if current_daily_wh < self.last_daily_register_value:
+                # Case 1: Register decreased = reset happened (normal sunrise)
                 self.daily_register_has_reset = True
                 self.state['daily_register_has_reset'] = True
-                logging.info(f"Detected REG_WHC_DAILY reset: {self.last_daily_register_value} → {current_daily_wh} Wh (sun came up)")
+                logging.info(f"Detected REG_WHC_DAILY reset (decrease): {self.last_daily_register_value} → {current_daily_wh} Wh")
+                logging.info(f"  Before: total={self.state['total_yield_kwh']:.3f} kWh, daily will become {current_daily_wh/1000.0:.3f} kWh")
+            elif self.last_daily_register_value == 0 and current_daily_wh > 0 and not self.daily_register_has_reset:
+                # Case 2: Register increased from 0 = charging started after zero-yield day
+                # Safe because: if register is updating (0 → X), it's not frozen
+                self.daily_register_has_reset = True
+                self.state['daily_register_has_reset'] = True
+                logging.info(f"Detected REG_WHC_DAILY reset (from zero): 0 → {current_daily_wh} Wh (no yield yesterday)")
 
-            # On first update after restart: Use TriStar's ACTUAL charge state (not Victron mapped)
-            # TriStar charge state >= 5 means charging (MPPT/Bulk or higher)
-            if self.last_daily_register_value == 0:  # First update
-                if cs_raw >= 5:
-                    # TriStar is charging → sun is up → Modbus registers are valid
-                    self.daily_register_has_reset = True
-                    self.state['daily_register_has_reset'] = True
-                    logging.info(f"First update: TriStar charging (cs_raw={cs_raw}) - Modbus valid")
-                else:
-                    # Not charging → use daily_register_has_reset from state.json (persists from before restart)
-                    # This way: restart before midnight = True (Modbus valid), restart after midnight = False (Modbus stale)
-                    logging.info(f"First update: not charging (cs_raw={cs_raw}) - using daily_register_has_reset={self.daily_register_has_reset} from state")
+            # On first update after restart: Trust state.json flag (persisted from before restart)
+            # Don't set flag based on charge state - wait for actual register decrease detection!
+            # This prevents spikes if driver restarts right at sunrise when register hasn't reset yet
+            if not self.first_update_done:
+                self.first_update_done = True
+                logging.info(f"First update: cs_raw={cs_raw}, using daily_register_has_reset={self.daily_register_has_reset} from state.json")
+                logging.info(f"  Will detect register reset on next cycle when whc_daily decreases")
+
+            # NOTE: We used to set daily_register_has_reset=True when detecting cs_raw >= 5
+            # But this caused spikes because whc_daily register doesn't reset immediately
+            # when charging starts - there's a delay. So we ONLY trust the register
+            # value decrease detection (line 1746 above). Never set flag based on charge state!
 
             self.last_daily_register_value = current_daily_wh
 
@@ -1264,6 +1782,23 @@ class TriStarDriver:
 
             # Check for midnight (date changed) - do this BEFORE updating history paths
             self._check_midnight_rollover(daily_kwh)
+
+            # CRITICAL: Recalculate daily_kwh AFTER all flag changes
+            # Flag can change in 3 places:
+            #  1. Line 1718: Register reset detected (False → True)
+            #  2. Line 1728: First update, charging detected (False → True)
+            #  3. Line 1740: Charging detected mid-day (False → True)
+            #  4. Midnight rollover: (True → False)
+            # We must recalculate to match current flag state, otherwise spike occurs
+            old_daily_kwh = daily_kwh  # Save for logging
+            if not self.daily_register_has_reset:
+                daily_kwh = 0.0  # Post-midnight pre-sunrise: use 0
+            else:
+                daily_kwh = current_daily_wh / 1000.0  # Sun is up: use Modbus
+
+            # Log if recalculation changed the value (indicates flag changed during this cycle)
+            if abs(daily_kwh - old_daily_kwh) > 0.001:
+                logging.info(f"🔄 Recalculated daily_kwh: {old_daily_kwh:.3f} → {daily_kwh:.3f} kWh (flag={self.daily_register_has_reset})")
 
             # Update state['today'] with current daily values (AFTER midnight check, so reset works correctly)
             # This will be saved every 5 minutes to preserve values across restarts
@@ -1324,8 +1859,208 @@ class TriStarDriver:
             current_time = time()
             if current_time - self.last_state_save_time >= self.state_save_interval:
                 logging.info(f"Periodic state save (5 min interval) - preserving today's values")
+                # Update voltage override state before saving
+                self.state['voltage_override']['stop_reason'] = self.stop_reason
                 self._save_state()
                 self.last_state_save_time = current_time
+
+            # ========================================================================
+            # VOLTAGE OVERRIDE CONTROL LOGIC
+            # ========================================================================
+
+            # Calculate excess power (sweep_Pin_max - threshold - P_out)
+            sweep_pmax = reg(REG_SWEEP_PMAX) * self.i_pu * self.v_pu / 131072.0  # Watts
+            p_out = reg(REG_POUT) * self.i_pu * self.v_pu / 131072.0  # Watts
+            excess_power_threshold = self.settings['excess_power_threshold']
+            excess_power = sweep_pmax - excess_power_threshold - p_out
+            self.dbus['/Custom/VoltageOverride/ExcessPower'] = round(excess_power, 0)
+
+            # Get safety limits from settings
+            max_time = self.settings['max_voltage_override_time']
+            battery_full_current = self.settings['battery_full_current']
+            tail_current_time = self.settings['tail_current_time']
+
+            # Get current battery measurements
+            i_charge = self._to_signed(reg(REG_I_CC_1M)) * self.i_pu / 32768.0  # Amps (filtered, 1-min avg)
+            v_battery = reg(REG_V_BAT) * self.v_pu / 32768.0  # Volts
+
+            current_time = time()
+
+            # Check if override is active
+            if self.pending_voltage_override is not None:
+                self.voltage_override_active = True
+
+                # Get target voltage for safety checks
+                target_voltage = self.register_to_voltage(self.pending_voltage_override)
+
+                # At target: V >= target (like Home Assistant binary_sensor.over_28_7v)
+                # This tolerates brief dips due to clouds/varying solar input
+                at_target_voltage = v_battery >= target_voltage
+
+                # Track cumulative time at or above target voltage (tolerates dips)
+                if not hasattr(self, 'time_above_target_accumulated'):
+                    self.time_above_target_accumulated = 0
+                if not hasattr(self, 'last_override_time_update'):
+                    self.last_override_time_update = current_time
+
+                # Initialize timer on first time reaching target
+                if at_target_voltage and self.override_start_time is None:
+                    self.override_start_time = current_time
+                    self.time_above_target_accumulated = 0
+                    self.last_override_time_update = current_time
+                    logging.info(f"Battery reached target voltage {target_voltage:.2f}V (>= {target_voltage:.2f}V) - starting cumulative timer")
+
+                # Accumulate time when at or above target
+                if at_target_voltage and self.override_start_time is not None:
+                    delta = current_time - self.last_override_time_update
+                    if 0 < delta < 10:  # Sanity check (max 10s between updates)
+                        self.time_above_target_accumulated += delta
+                    self.last_override_time_update = current_time
+
+                time_at_target = self.time_above_target_accumulated
+
+                # Safety check 1: Time at target voltage limit exceeded?
+                if at_target_voltage and time_at_target >= max_time:
+                    logging.warning(f"Max time at target voltage exceeded ({int(time_at_target)}s >= {max_time}s)")
+                    self.stop_reason = "TimeLimit"
+                    self.pending_voltage_override = None
+                    self.voltage_override_active = False
+                    self.override_start_time = None
+                    self.tail_current_start_time = None
+                    self.time_above_target_accumulated = 0
+                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+
+                # Safety check 2: Battery full (tail current)?
+                # Check voltage at target AND (excess power OR disabled) AND low current
+                else:
+                    # Excess power check: skip if threshold is -1 (disabled)
+                    check_excess_power = (excess_power_threshold == -1) or (excess_power > 0)
+
+                    if at_target_voltage and check_excess_power and i_charge < battery_full_current:
+                        # Start tail current timer if not already started
+                        if self.tail_current_start_time is None:
+                            self.tail_current_start_time = current_time
+                            logging.info(f"Tail current detected: V={v_battery:.2f}V (target={target_voltage:.2f}V), I={i_charge:.2f}A < {battery_full_current}A")
+
+                        # Check if tail current condition held long enough
+                        tail_duration = current_time - self.tail_current_start_time
+                        if tail_duration >= tail_current_time:
+                            logging.info(f"Battery full detected: voltage at {v_battery:.2f}V, tail current {i_charge:.2f}A for {int(tail_duration)}s")
+                            self.stop_reason = "BatteryFull"
+                            self.pending_voltage_override = None
+                            self.voltage_override_active = False
+                            self.tail_current_start_time = None
+                            self.override_start_time = None
+                            self.time_above_target_accumulated = 0
+                            self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                    else:
+                        # Reset tail current timer if conditions not met
+                        # (voltage not reached, current too high, or no excess power)
+                        if self.tail_current_start_time is not None:
+                            logging.debug(f"Tail current timer reset: at_voltage={at_target_voltage}, excess={excess_power:.0f}W, I={i_charge:.2f}A")
+                        self.tail_current_start_time = None
+
+                # Update monitoring paths
+                self.dbus['/Custom/VoltageOverride/TimeAtTargetVoltage'] = int(time_at_target)
+                self.dbus['/Custom/VoltageOverride/TailCurrentTimer'] = int(current_time - self.tail_current_start_time) if self.tail_current_start_time else 0
+            else:
+                self.voltage_override_active = False
+                self.override_start_time = None
+                self.tail_current_start_time = None
+                self.time_above_target_accumulated = 0
+
+            self.dbus['/Custom/VoltageOverride/Active'] = self.voltage_override_active
+            self.dbus['/Custom/VoltageOverride/StopReason'] = self.stop_reason
+
+            # Periodic register write (every 30 seconds to maintain slave mode)
+            if self.pending_voltage_override is not None:
+                current_time = time()
+                if current_time - self.last_voltage_override_write >= self.voltage_override_interval:
+                    success = self.write_holding_register(89, self.pending_voltage_override)  # PDU 89 = vb_ref_slave
+                    if success:
+                        self.last_voltage_override_write = current_time
+                        actual_voltage = self.register_to_voltage(self.pending_voltage_override)
+                        logging.info(f"Updated Vb_ref_slave: {actual_voltage:.2f}V (reg: {self.pending_voltage_override})")
+                        self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = round(actual_voltage, 2)
+
+                        # Read back PDU 89 to verify (periodic check)
+                        readback = self.read_holding_registers(89, 1)  # PDU 89 = vb_ref_slave
+                        if readback is not None:
+                            readback_value = self._to_signed(readback[0])
+                            readback_voltage = self.register_to_voltage(readback_value)
+                            self.dbus['/Custom/VoltageOverride/RegisterReadback'] = round(readback_voltage, 2)
+                            if abs(readback_voltage - actual_voltage) > 0.1:
+                                logging.warning(f"PDU 89 readback mismatch: wrote {actual_voltage:.2f}V, read {readback_voltage:.2f}V")
+                    else:
+                        logging.warning(f"Failed to write Vb_ref_slave register")
+            else:
+                # Override not active - ensure CurrentVoltage shows 0
+                self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
+                self.dbus['/Custom/VoltageOverride/RegisterReadback'] = 0.0
+
+            # ========================================================================
+            # END VOLTAGE OVERRIDE CONTROL LOGIC
+            # ========================================================================
+
+            # ========================================================================
+            # CURRENT OVERRIDE CONTROL LOGIC (PDU register 88 - Ib_ref_slave, Logical 89)
+            # ========================================================================
+
+            # Periodic register write for current override (every 30 seconds to maintain slave mode)
+            if self.pending_current_override is not None:
+                current_time = time()
+                if current_time - self.last_current_override_write >= self.voltage_override_interval:  # Use same 30s interval
+                    success = self.write_holding_register(88, self.pending_current_override)  # PDU 88 = Ib_ref_slave
+                    if success:
+                        self.last_current_override_write = current_time
+                        actual_current = self.register_to_current(self.pending_current_override)
+                        logging.info(f"Updated Ib_ref_slave: {actual_current:.2f}A (reg: {self.pending_current_override})")
+                        self.dbus['/Custom/CurrentOverride/CurrentValue'] = round(actual_current, 2)
+
+                        # Read back PDU 88 to verify (periodic check)
+                        readback = self.read_holding_registers(88, 1)  # PDU 88 = Ib_ref_slave
+                        if readback is not None:
+                            readback_value = self._to_signed(readback[0])
+                            readback_current = self.register_to_current(readback_value)
+                            self.dbus['/Custom/CurrentOverride/RegisterReadback'] = round(readback_current, 2)
+                            if abs(readback_current - actual_current) > 0.5:
+                                logging.warning(f"PDU 88 readback mismatch: wrote {actual_current:.2f}A, read {readback_current:.2f}A")
+                    else:
+                        logging.warning(f"Failed to write Ib_ref_slave register")
+            else:
+                # Override not active - ensure current shows 0
+                self.dbus['/Custom/CurrentOverride/CurrentValue'] = 0.0
+                self.dbus['/Custom/CurrentOverride/RegisterReadback'] = 0.0
+
+            self.dbus['/Custom/CurrentOverride/Active'] = self.current_override_active
+
+            # ========================================================================
+            # END CURRENT OVERRIDE CONTROL LOGIC
+            # ========================================================================
+
+            # Read manual control registers that might interfere with slave mode
+            # These should normally be 0 unless explicitly set
+            va_ref_fixed_regs = self.read_holding_registers(90, 2)  # Read PDU 90-91 (va_ref_fixed, va_ref_fixed_pct)
+            if va_ref_fixed_regs is not None:
+                # Register 91 (0x005A): Va_ref_fixed - Array voltage fixed target
+                va_ref_fixed_raw = self._to_signed(va_ref_fixed_regs[0])
+                if va_ref_fixed_raw > 0:
+                    va_ref_fixed = va_ref_fixed_raw * self.v_pu / 32768.0
+                    self.dbus['/Custom/ManualControl/VaRefFixed'] = round(va_ref_fixed, 2)
+                    if va_ref_fixed > 1.0:  # Only warn if significantly non-zero
+                        logging.warning(f"Va_ref_fixed is set to {va_ref_fixed:.2f}V - this disables MPPT sweeping!")
+                else:
+                    self.dbus['/Custom/ManualControl/VaRefFixed'] = 0.0
+
+                # Register 92 (0x005B): Va_ref_fixed_pct - Array voltage % of Voc
+                va_ref_fixed_pct_raw = self._to_signed(va_ref_fixed_regs[1])
+                if va_ref_fixed_pct_raw > 0:
+                    va_ref_fixed_pct = va_ref_fixed_pct_raw * 100.0 / 32768.0
+                    self.dbus['/Custom/ManualControl/VaRefFixedPct'] = round(va_ref_fixed_pct, 1)
+                    if va_ref_fixed_pct > 1.0:  # Only warn if significantly non-zero
+                        logging.warning(f"Va_ref_fixed_pct is set to {va_ref_fixed_pct:.1f}% - this disables MPPT sweeping!")
+                else:
+                    self.dbus['/Custom/ManualControl/VaRefFixedPct'] = 0
 
             # Total yield (use persistent counter to avoid double-counting)
             # Do NOT auto-initialize from TriStar registers (they may be reset or have wrong baseline)
@@ -1337,14 +2072,34 @@ class TriStarDriver:
                 logging.warning("  Edit /data/dbus-tristar/state.json and set 'total_yield_kwh' to correct value.")
 
             # Total yield: persistent total + today's calculated yield (already handled above)
-            self.dbus['/Yield/User'] = round(self.state['total_yield_kwh'] + daily_kwh, 2)
-            self.dbus['/Yield/System'] = round(self.state['total_yield_kwh'] + daily_kwh, 2)
+            new_yield_system = round(self.state['total_yield_kwh'] + daily_kwh, 2)
+
+            # Log significant changes (> 0.1 kWh jump in one cycle = potential spike)
+            if hasattr(self, 'last_yield_system'):
+                delta = abs(new_yield_system - self.last_yield_system)
+                if delta > 0.1:
+                    logging.warning(f"⚠️  SPIKE DETECTED ⚠️")
+                    logging.warning(f"Large /Yield/System change: {self.last_yield_system:.2f} → {new_yield_system:.2f} kWh (Δ={delta:.2f})")
+                    logging.warning(f"  total_yield_kwh={self.state['total_yield_kwh']:.3f}, daily_kwh={daily_kwh:.3f}, daily_reg_reset={self.daily_register_has_reset}")
+                    logging.warning(f"  current_daily_wh={current_daily_wh} Wh, last_daily_reg={self.last_daily_register_value} Wh")
+                    logging.warning(f"  cs_raw={cs_raw}, cs={cs}, first_update_done={self.first_update_done}")
+
+            self.dbus['/Yield/User'] = new_yield_system
+            self.dbus['/Yield/System'] = new_yield_system
+            self.last_yield_system = new_yield_system
 
             # Read stateful coils
             coils = self.read_coils(COIL_EQUALIZE, 3)  # Read coils 0, 1, 2
             if coils is not None:
                 self.dbus['/Control/EqualizeTriggered'] = int(coils[0])
                 self.dbus['/Control/ChargerDisconnect'] = int(coils[2])
+
+                # Update /Mode based on COIL_DISCONNECT state (coil 2)
+                # Coil 2 = 0 → Mode = 1 (On), Coil 2 = 1 → Mode = 4 (Off)
+                if coils[2]:
+                    self.dbus['/Mode'] = 4  # Charger disconnected (Off)
+                else:
+                    self.dbus['/Mode'] = 1  # Charger connected (On)
             else:
                 logging.warning("Failed to read coils - control status may be stale")
 
@@ -1395,14 +2150,29 @@ class TriStarDriver:
                 # Mark as attempted BEFORE trying (prevent retry spam if write fails)
                 self.last_reset_date = current_date
 
-                logging.info(f"Performing nightly TriStar comm server reset at {reset_hour:02d}:00 local time")
+                logging.info(f"Performing nightly reset at {reset_hour:02d}:00 local time")
 
-                # Reset comm server
+                # 1. Disable voltage override (prevent stuck topcharging)
+                if self.pending_voltage_override is not None:
+                    logging.info("Nightly reset: Disabling voltage override")
+                    self.pending_voltage_override = None
+                    self.voltage_override_active = False
+                    self.stop_reason = "NightlyReset"
+                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+
+                # 2. Reset cumulative time counter (fresh start for new day)
+                if self.time_above_target_accumulated > 0:
+                    logging.info(f"Nightly reset: Clearing cumulative time counter ({int(self.time_above_target_accumulated)}s)")
+                self.time_above_target_accumulated = 0
+                self.override_start_time = None
+                self.tail_current_start_time = None
+
+                # 3. Reset TriStar comm server
                 success = self.write_coil(COIL_RESET_COMM, True)
                 if success:
                     logging.info("Nightly reset completed successfully")
                 else:
-                    logging.error("Nightly reset failed - will retry tomorrow")
+                    logging.error("Nightly comm server reset failed - will retry tomorrow")
 
     @staticmethod
     def _to_signed(value):
