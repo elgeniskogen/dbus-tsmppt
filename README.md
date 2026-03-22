@@ -9,6 +9,10 @@
 ✅ **WAN-ready** - Works over internet with optimized timeouts
 ✅ **Advanced features** - Voltage override, tail current detection, 30-day history
 
+In my off-grid system the Morningstar Tristar MPPT 60 is used to charge a 7.7kWh Lithium battery with top charge voltage of 28.7V. As lithium batteries doe not like to stand top-charged over time, I normally charge to 28.36V and only top charge, using this driver, every month to ballance the cells or if I need more capacity for my next visit to the cottage
+
+My Venus OS is connected to Home Assistant where I expose all the extra features in this driver. 
+
 📚 **[Complete Documentation](DRIVER_DOCUMENTATION.md)** - All D-Bus paths, logic, and advanced features
 
 ---
@@ -374,3 +378,9 @@ MIT License - See [LICENSE](LICENSE)
 **Enjoy your TriStar MPPT on Venus OS! ☀️🔋**
 
 Questions? Check the logs: `tail -f /var/log/dbus-tristar/current`
+
+TO DO LIST:
+* Check modbus parameters to be used for I and V. Now it is a mix of fast and slow.
+* Remove/change excess power estimation as this is not working properly
+* Add monthly top charging in driver with indircation for discharging afterwards
+
