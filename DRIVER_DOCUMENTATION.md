@@ -282,16 +282,33 @@ if at_target and override_start_time is None:
     override_start_time = current_time
     time_above_target_accumulated = 0
 
-if at_target:
+if at_target:  # ONLY accumulates when V >= target!
     delta = current_time - last_update
     if 0 < delta < 10:  # Sanity check
         time_above_target_accumulated += delta
+# If V < target: Counter PAUSES (doesn't increase, doesn't reset)
 
 # Result: Cumulative seconds at/above target
 time_at_target = time_above_target_accumulated
 ```
 
-**Why cumulative?** Brief voltage dips (e.g., 28.69V for 5 seconds) don't reset the timer. Only sustained time below target matters.
+**Behavior during voltage dips:**
+- ✅ Counts ONLY when V >= target voltage
+- ✅ PAUSES when V < target (stops counting)
+- ✅ Does NOT reset when voltage dips
+- ✅ RESUMES counting when V >= target again
+
+**Example:**
+```
+10:00 - V=28.70V → Counter starts, accumulated = 0s
+10:30 - V=28.71V → accumulated = 1800s (30 min AT target)
+10:30 - V=28.68V → PAUSED at 1800s (below target, stops counting)
+10:31 - V=28.67V → Still 1800s (paused, not counting)
+10:32 - V=28.70V → RESUMES counting from 1800s
+10:33 - V=28.71V → accumulated = 1860s (30 min + 1 min AT target)
+```
+
+This is **cumulative time AT/ABOVE target**, not total elapsed time. Brief dips don't reset the counter, they just pause it.
 
 #### 4. Tail Current Detection
 
@@ -313,8 +330,24 @@ if at_target and i_charge < battery_full_current:
         stop_reason = "BatteryFull"
         write_holding_register(89, -1)  # Disable override
 else:
-    tail_current_start_time = None  # Reset timer
+    tail_current_start_time = None  # RESET timer to zero!
 ```
+
+**Behavior during current fluctuations:**
+- ✅ Counts only when ALL conditions are met (V >= target AND I < threshold)
+- ❌ RESETS to zero if ANY condition fails
+- ⚠️ Different from TimeAtTarget which only pauses!
+
+**Example:**
+```
+11:00 - V=28.70V, I=1.8A → Timer starts, duration = 0s
+11:02 - V=28.71V, I=1.7A → duration = 120s
+11:03 - V=28.72V, I=2.1A → RESET to 0s! (I > 2.0A)
+11:04 - V=28.71V, I=1.9A → Timer starts again, duration = 0s
+11:09 - V=28.70V, I=1.8A → duration = 300s → BATTERY FULL!
+```
+
+**CRITICAL:** This must be **300 seconds continuously** with low current. Any spike above threshold resets the timer!
 
 #### 5. Time Limit
 
@@ -351,6 +384,40 @@ Immediately writes -1 (0xFFFF in two's complement) to PDU 89 to disable slave mo
 ```
 /Custom/VoltageOverride/StopReason = "BatteryFull"
 ```
+
+### Timer Comparison: TimeAtTarget vs TailCurrent
+
+**Important:** These two timers work differently!
+
+| Timer | Behavior | Reset Condition | Purpose |
+|-------|----------|-----------------|---------|
+| **TimeAtTarget** | PAUSES during dips | Never resets (only on disable) | Safety time limit (2h max) |
+| **TailCurrent** | RESETS to zero | Resets if I > threshold OR V < target | Detect battery full |
+
+**Example scenario:**
+```
+10:00 - V=28.70V, I=8.0A
+  → TimeAtTarget starts (0s)
+  → TailCurrent not started (I too high)
+
+10:30 - V=28.71V, I=1.8A
+  → TimeAtTarget = 1800s (counting continuously)
+  → TailCurrent starts (0s)
+
+10:32 - V=28.68V, I=1.9A  (brief voltage dip)
+  → TimeAtTarget = 1920s (PAUSED, but not reset)
+  → TailCurrent RESET to 0s! (V < target)
+
+10:33 - V=28.70V, I=1.7A
+  → TimeAtTarget = 1920s (RESUMES counting)
+  → TailCurrent starts again (0s)
+
+10:38 - V=28.71V, I=1.6A
+  → TimeAtTarget = 2220s
+  → TailCurrent = 300s → BATTERY FULL!
+```
+
+**Key insight:** TimeAtTarget is forgiving (pauses), TailCurrent is strict (resets). This ensures we only stop charging when conditions have been stable for 5 continuous minutes.
 
 ---
 
