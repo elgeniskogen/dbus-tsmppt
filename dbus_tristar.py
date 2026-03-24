@@ -385,7 +385,7 @@ class TriStarDriver:
                 "min_battery_voltage": 999.0,
                 "time_bulk": 0
             },
-            "history": [],  # Will grow to 30 days
+            "history": [],  # Will grow to 30 days (Day 1-30)
             "lifetime": {
                 "max_pv_voltage": 0.0,
                 "max_battery_voltage": 0.0,
@@ -455,11 +455,11 @@ class TriStarDriver:
             history = self.state.get('history', [])
 
             # Update DaysAvailable: number of historical days + today (day 0)
-            days_available = min(len(history) + 1, 30)  # Max 30 days
+            days_available = min(len(history) + 1, 31)  # Max 31 days (Day 0-30)
             self.dbus['/History/Overall/DaysAvailable'] = days_available
 
-            # Only create paths for days that have actual data (days 1-29)
-            # This prevents Venus OS from thinking we have 30 days when we only have 1
+            # Only create paths for days that have actual data (days 1-30)
+            # This prevents Venus OS from thinking we have 31 days when we only have 1
             for history_index in range(len(history)):
                 day_index = history_index + 1  # history[0] = day 1 (yesterday)
 
@@ -536,10 +536,10 @@ class TriStarDriver:
                 # Insert yesterday at position 0, shifting everything
                 self.state['history'].insert(0, yesterday_snapshot)
 
-                # Keep only 29 days of history (day 0 = today, days 1-29 = history)
-                if len(self.state['history']) > 29:
-                    self.state['history'] = self.state['history'][:29]
-                    logging.info(f"Trimmed history to 29 days (oldest day removed)")
+                # Keep only 30 days of history (day 0 = today, days 1-30 = history)
+                if len(self.state['history']) > 30:
+                    self.state['history'] = self.state['history'][:30]
+                    logging.info(f"Trimmed history to 30 days (oldest day removed)")
 
                 # Update current date
                 self.last_reset_date = current_date
@@ -646,7 +646,7 @@ class TriStarDriver:
         s.add_path('/History/Daily/0/TimeInEqualize', 0)
 
         # History - Days 1-29 will be created dynamically as history accumulates
-        # This prevents Venus OS from thinking we have 30 days of data when we don't
+        # This prevents Venus OS from thinking we have 31 days of data when we don't
 
         # Total yield
         s.add_path('/Yield/User', 0.0, gettextcallback=lambda p, v: f"{v}kWh")

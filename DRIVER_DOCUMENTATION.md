@@ -27,7 +27,7 @@ This driver reads data from a Morningstar TriStar MPPT charge controller via Mod
 - **Voltage override** for battery top-charging (equalization)
 - **Automatic battery full detection** via tail current monitoring
 - **Cumulative time tracking** (tolerates brief voltage dips)
-- **30-day history** tracking with daily max/min values
+- **31-day history** tracking with daily max/min values (Day 0-30)
 - **Nightly reset** to prevent stuck charging sessions
 - **State persistence** across reboots
 
@@ -85,11 +85,11 @@ These paths follow the Victron solar charger specification:
 /Yield/System                    = Lifetime total yield (kWh) - from state.json
 ```
 
-#### Historical Data (Days 1-29)
+#### Historical Data (Days 1-30)
 ```
 /History/Daily/1/Yield           = Yesterday's yield (kWh)
 /History/Daily/1/MaxPower        = Yesterday's max power (W)
-... (same fields for days 1-29)
+... (same fields for days 1-30)
 ```
 
 ---
@@ -607,7 +607,7 @@ if local_date != state['current_date']:
     # 2. Add today's yield to lifetime total
     total_yield_kwh += state['today']['yield_kwh']
 
-    # 3. Keep only 30 days of history
+    # 3. Keep only 30 days of history (Day 1-30, plus Day 0 = 31 total)
     history = history[:30]
 
     # 4. Reset today's values

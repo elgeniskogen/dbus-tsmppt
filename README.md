@@ -7,7 +7,7 @@
 ✅ **No QML required** - Configure via D-Bus command line
 ✅ **100% compatible** - Same data as original C++ driver
 ✅ **WAN-ready** - Works over internet with optimized timeouts
-✅ **Advanced features** - Voltage override, tail current detection, 30-day history
+✅ **Advanced features** - Voltage override, tail current detection, 31-day history
 
 In my off-grid system the Morningstar Tristar MPPT 60 is used to charge a 7.7kWh Lithium battery with top charge voltage of 28.7V. As lithium batteries doe not like to stand top-charged over time, I normally charge to 28.36V and only top charge, using this driver, every month to ballance the cells or if I need more capacity for my next visit to the cottage
 
@@ -22,7 +22,7 @@ My Venus OS is connected to Home Assistant where I expose all the extra features
 ✅ **Voltage Override System** - Battery top-charging with automatic tail current detection
 ✅ **Cumulative Time Tracking** - Tolerates brief voltage dips (Home Assistant pattern)
 ✅ **Nightly Reset** - Prevents stuck charging sessions (configurable hour)
-✅ **30-Day History** - Daily max/min tracking with state persistence
+✅ **31-Day History** - Daily max/min tracking with state persistence
 ✅ **EEPROM Counters** - Lifetime kWh from TriStar's internal registers
 
 ---
@@ -282,7 +282,7 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Stats/LastSuccessTime G
 - Service name: `com.victronenergy.solarcharger.tristar_{instance}` (configurable)
 - 50+ D-Bus paths: Standard Victron + Custom monitoring/control
 - Full settings integration: `/Settings/TristarMPPT/*`
-- State persistence: 30-day history in `/data/dbus-tristar/state.json`
+- State persistence: 31-day history in `/data/dbus-tristar/state.json`
 
 **For complete technical details, D-Bus path reference, Modbus registers, and troubleshooting:**
 📚 **See [DRIVER_DOCUMENTATION.md](DRIVER_DOCUMENTATION.md)**
