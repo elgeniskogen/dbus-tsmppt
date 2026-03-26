@@ -1,6 +1,6 @@
 # TriStar MPPT Driver - Complete Documentation
 
-**Version:** 2.24
+**Version:** 2.26
 **Author:** dbus-tristar driver
 **Target:** Morningstar TriStar MPPT 60 via Modbus TCP
 
@@ -12,11 +12,12 @@
 2. [D-Bus Paths Reference](#dbus-paths-reference)
 3. [Voltage Override System](#voltage-override-system)
 4. [Current Override System](#current-override-system)
-5. [Automatic Battery Full Detection](#automatic-battery-full-detection)
-6. [Nightly Reset Logic](#nightly-reset-logic)
-7. [Daily History & State Persistence](#daily-history--state-persistence)
-8. [Configuration](#configuration)
-9. [Modbus Register Reference](#modbus-register-reference)
+5. [Charge Profile Management System](#charge-profile-management-system)
+6. [Automatic Battery Full Detection](#automatic-battery-full-detection)
+7. [Nightly Reset Logic](#nightly-reset-logic)
+8. [Daily History & State Persistence](#daily-history--state-persistence)
+9. [Configuration](#configuration)
+10. [Modbus Register Reference](#modbus-register-reference)
 
 ---
 
@@ -24,6 +25,7 @@
 
 This driver reads data from a Morningstar TriStar MPPT charge controller via Modbus TCP and exposes it to Venus OS via D-Bus. It implements advanced features including:
 
+- **Charge profile management** for seasonal battery optimization (EEPROM programming)
 - **Voltage override** for battery top-charging (equalization)
 - **Automatic battery full detection** via tail current monitoring
 - **Cumulative time tracking** (tolerates brief voltage dips)
@@ -125,6 +127,34 @@ TailCurrentTime           = 300            (Sustained tail current time in secon
 ExcessPowerThreshold      = 100            (Minimum excess power in W, range: -1-5000, -1=disabled)
 ```
 
+#### Charge Profile Settings
+```
+ChargeProfiles/Summer/AbsorptionVoltage     = 28.4  (V, range: 26.0-32.0)
+ChargeProfiles/Summer/FloatVoltage          = 27.2  (V, range: 24.0-30.0)
+ChargeProfiles/Summer/AbsorptionTime        = 7200  (seconds, range: 3600-36000)
+ChargeProfiles/Summer/FloatCancelVoltage    = 26.0  (V, range: 22.0-28.0)
+
+ChargeProfiles/Winter/AbsorptionVoltage     = 28.8  (V, range: 26.0-32.0)
+ChargeProfiles/Winter/FloatVoltage          = 27.6  (V, range: 24.0-30.0)
+ChargeProfiles/Winter/AbsorptionTime        = 9000  (seconds, range: 3600-36000)
+ChargeProfiles/Winter/FloatCancelVoltage    = 26.4  (V, range: 22.0-28.0)
+
+ChargeProfiles/Custom/AbsorptionVoltage     = 28.6  (V, range: 26.0-32.0)
+ChargeProfiles/Custom/FloatVoltage          = 27.4  (V, range: 24.0-30.0)
+ChargeProfiles/Custom/AbsorptionTime        = 8400  (seconds, range: 3600-36000)
+ChargeProfiles/Custom/FloatCancelVoltage    = 26.2  (V, range: 22.0-28.0)
+```
+
+**Note:** All voltage values are actual system voltages. Driver automatically converts to 12V-equivalent when writing to EEPROM (12V/24V/48V systems supported).
+
+**Example:** Configure custom winter profile
+```bash
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage SetValue 29.0
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage SetValue 27.8
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime SetValue 10800
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage SetValue 26.6
+```
+
 **Example:** Change tail current threshold
 ```bash
 dbus -y com.victronenergy.settings /Settings/TristarMPPT/BatteryFullCurrent SetValue 1.5
@@ -163,6 +193,20 @@ Located at: `venus-home/N/.../solarcharger/0/Control/...`
   Register: PDU 88 (Ib_ref_slave)
   NOTE: Auto-enables voltage override to maintain slave mode
   WARNING: Less tested than voltage-only override
+```
+
+#### Charge Profile Management
+```
+/Control/ApplyChargeProfile     WRITEABLE (text)
+  "summer"  = Apply summer profile (lower voltage, shorter absorption)
+  "winter"  = Apply winter profile (higher voltage, longer absorption)
+  "custom"  = Apply custom profile (user-configurable via Settings)
+
+  Effect: Writes charge parameters to EEPROM with safety checks
+  Safety: DISCONNECT → Write → Verify → Reset controller
+  Thread-safe: Main loop paused during operation
+  Backup: Automatic backup before changes
+  Status: Monitor via /Custom/ChargeProfile/ApplyStatus
 ```
 
 #### Coil Controls (Momentary Triggers)
@@ -204,14 +248,28 @@ Located at: `venus-home/N/.../solarcharger/0/Custom/...`
 /Custom/Daily/ChargeAh                      (Ah) - Daily Ah from TriStar
 ```
 
-#### EEPROM Counters (TriStar's Internal)
+#### EEPROM Counters & Charge Parameters (TriStar's Internal)
 ```
 /Custom/EEPROM/ChargeKwhTotal               (kWh) - Lifetime total from 0xE087
 /Custom/EEPROM/ChargeKwhResetable           (kWh) - Resetable counter from 0xE086
-/Custom/EEPROM/AbsorptionVoltage            (V) - Configured absorption voltage
+/Custom/EEPROM/AbsorptionVoltage            (V) - Active absorption voltage (0xE000)
+/Custom/EEPROM/FloatVoltage                 (V) - Active float voltage (0xE001)
+/Custom/EEPROM/AbsorptionTime               (sec) - Active absorption time (0xE002)
+/Custom/EEPROM/FloatCancelVoltage           (V) - Active float cancel voltage (0xE005)
 /Custom/EEPROM/EqualizeVoltage              (V) - Configured equalize voltage
 /Custom/EEPROM/TempCompensation             (V/C) - Temperature compensation
 /Custom/EEPROM/MaxRegulationLimit           (V) - Max regulation voltage limit
+```
+
+**Note:** Voltage values are automatically scaled for 12V/24V/48V systems. EEPROM stores 12V-equivalent values, driver converts to actual system voltage.
+
+#### Charge Profile Status
+```
+/Custom/ChargeProfile/ApplyStatus           (text) - Profile apply operation status
+  Values: "idle", "validating", "disconnecting", "writing", "resetting", "success", "failed"
+/Custom/ChargeProfile/ProgressPercent       (%) - Apply operation progress (0-100)
+/Custom/ChargeProfile/LastError             (text) - Last error message (if failed)
+/Custom/ChargeProfile/LastApplied           (text) - "profile_name at YYYY-MM-DD HH:MM:SS"
 ```
 
 #### Battery & Internal Monitoring
@@ -441,6 +499,202 @@ Payload: 10.0   (current limit in Amps)
 
 ### Warning
 Less tested than voltage-only override. Testing showed voltage override alone is sufficient for top-charging.
+
+---
+
+## Charge Profile Management System
+
+### Purpose
+Switch between seasonal battery charging profiles (summer/winter/custom) by safely programming EEPROM charge parameters. Optimizes battery life and capacity based on temperature and usage patterns.
+
+### Use Cases
+- **Summer:** Lower voltage (28.4V), shorter absorption (2h) - prevents overcharging in warm weather
+- **Winter:** Higher voltage (28.8V), longer absorption (2.5h) - ensures full charge in cold weather
+- **Custom:** User-defined profile for specific battery type or location
+
+### Parameters Programmed
+Each profile sets four EEPROM charge parameters:
+- **AbsorptionVoltage** (EV_absorp) - Target voltage for absorption stage
+- **FloatVoltage** (EV_float) - Voltage for float/maintenance stage
+- **AbsorptionTime** (Et_absorp) - Duration of absorption stage
+- **FloatCancelVoltage** (EV_float_cancel) - Voltage below which float is cancelled
+
+### How It Works
+
+#### 1. Configure Profile (Optional)
+```bash
+# Customize the custom profile via D-Bus Settings
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage SetValue 28.8
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage SetValue 27.6
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime SetValue 9000
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage SetValue 26.4
+```
+
+Summer and winter profiles have fixed defaults and cannot be customized via D-Bus.
+
+#### 2. Apply Profile
+```bash
+# Via D-Bus
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "winter"
+
+# Via MQTT (Home Assistant)
+mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile" -m '{"value": "winter"}'
+```
+
+#### 3. Driver Executes Safe EEPROM Write Procedure
+Following Morningstar's recommended procedure:
+
+**Step 1: Validation**
+- Read profile settings from D-Bus
+- Validate parameter relationships (float < absorption, etc.)
+- Read current EEPROM values
+- Compare and filter (only write changed parameters)
+
+**Step 2: Backup**
+- Create timestamped backup: `/data/dbus-tristar/eeprom_backups/backup_YYYYMMDD_HHMMSS.json`
+- Backup includes all four charge parameters
+
+**Step 3: DISCONNECT**
+- Set COIL_DISCONNECT (stop charging)
+- Poll for DISCONNECT state (max 5s)
+- Ensures controller is not actively regulating
+
+**Step 4: Write EEPROM**
+- Write parameters in safe order (lowest voltage first):
+  1. FloatCancelVoltage (EV_float_cancel, register 0xE005)
+  2. FloatVoltage (EV_float, register 0xE001)
+  3. AbsorptionVoltage (EV_absorp, register 0xE000)
+  4. AbsorptionTime (Et_absorp, register 0xE002)
+- Automatic voltage scaling (12V→24V→48V conversion)
+- 200ms delay between writes
+
+**Step 5: Verify**
+- Read back all written parameters
+- Convert from 12V-equivalent to actual voltage
+- Tolerance: ±0.1V for voltages, exact match for time
+- Raises exception if verification fails
+
+**Step 6: Reset Controller**
+- Write COIL_RESET_CTRL (Morningstar recommended)
+- Controller reboots (connection closes - expected)
+- Smart reconnect with polling (typical 0.5-1.0s)
+
+**Step 7: Verify Normal Operation**
+- Check charge state (should exit DISCONNECT)
+- Update active EEPROM display paths
+- Mark operation as successful
+
+### Thread Safety
+- Main update loop **paused** during entire operation
+- Dedicated Modbus client created for EEPROM writes
+- Prevents collision with regular polling
+- Main loop resumes in finally block (even on error)
+
+### Voltage Scaling (Critical)
+EEPROM stores **12V-equivalent** values. Driver automatically detects system voltage from V_PU:
+- **V_PU < 100:** 12V system (scale = 1×)
+- **V_PU < 200:** 24V system (scale = 2×)
+- **V_PU ≥ 200:** 48V system (scale = 4×)
+
+**Example:** Writing 28.6V on 24V system:
+```python
+voltage_12v = 28.6 / 2 = 14.3V               # Convert to 12V-equivalent
+raw_value = round(14.3 / (v_pu * 2^-15))     # Scale to register value
+# Write raw_value to EEPROM
+# Read back: 14.3V × 2 = 28.6V                # Convert back to system voltage
+```
+
+This matches MS View behavior and ensures exact values (e.g., 26.2V reads back as 26.2V, not 26.19V).
+
+### Monitoring
+
+#### Status
+```bash
+# Check operation status
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/ApplyStatus GetValue
+# Returns: "idle", "validating", "disconnecting", "writing", "resetting", "success", "failed"
+
+# Check progress
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/ProgressPercent GetValue
+# Returns: 0-100
+
+# Check for errors
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/LastError GetValue
+
+# Check what was last applied
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/LastApplied GetValue
+# Returns: "winter at 2026-03-26 20:45:48"
+```
+
+#### Active EEPROM Values
+```bash
+# Check what's actually programmed in the controller
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/AbsorptionVoltage GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/FloatVoltage GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/AbsorptionTime GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/FloatCancelVoltage GetValue
+```
+
+These values update automatically after successful profile apply.
+
+### Safety Features
+1. **Parameter validation** - Ensures float < absorption, values in safe ranges
+2. **DISCONNECT before writes** - Controller not actively regulating
+3. **Backups** - Automatic timestamped backup before changes
+4. **Verification** - Read-after-write with tolerance checking
+5. **Thread safety** - Main loop paused, no Modbus collisions
+6. **Voltage limits** - Enforced in Settings (26.0-32.0V absorption, 24.0-30.0V float)
+7. **Smart retry** - Control path resets to '' after each operation, allows immediate retry
+8. **Status tracking** - ApplyStatus prevents concurrent operations
+
+### Typical Operation Time
+- **No changes:** < 1 second (validation only)
+- **With EEPROM writes:** 10-15 seconds
+  - Validation: 1s
+  - DISCONNECT: 1s
+  - Write 4 parameters: 2s
+  - Verify: 1s
+  - Reset + reconnect: 5-8s
+  - Final verification: 1s
+
+### Error Handling
+If operation fails:
+- Status set to "failed"
+- Error message available in LastError path
+- Controller attempts to re-enable charging (clear DISCONNECT)
+- Main loop resumes (driver continues normal operation)
+- User can retry after fixing issue (status resets to "idle" on next attempt)
+
+### Home Assistant Integration Example
+```yaml
+# Seasonal automation
+automation:
+  - alias: "Apply Winter Charge Profile"
+    trigger:
+      - platform: time
+        at: "00:00:00"
+    condition:
+      - condition: template
+        value_template: "{{ now().month in [11, 12, 1, 2, 3] }}"  # Nov-Mar
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile"
+          payload: '{"value": "winter"}'
+
+  - alias: "Apply Summer Charge Profile"
+    trigger:
+      - platform: time
+        at: "00:00:00"
+    condition:
+      - condition: template
+        value_template: "{{ now().month in [4, 5, 6, 7, 8, 9, 10] }}"  # Apr-Oct
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile"
+          payload: '{"value": "summer"}'
+```
 
 ---
 

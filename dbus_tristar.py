@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.25"  # Add EEPROM charge profile management (summer/winter/custom)
+VERSION = "2.25"  # Add EEPROM charge profile management + fix 12V/24V/48V voltage scaling
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -245,6 +245,7 @@ class TriStarDriver:
         # Scaling factors (read from device)
         self.v_pu = 0.0
         self.i_pu = 0.0
+        self.system_voltage_scale = 1  # Multiplier for EEPROM voltages (1=12V, 2=24V, 4=48V)
 
         # Static device info
         self.firmware_version = 0
@@ -1460,6 +1461,16 @@ class TriStarDriver:
         self.i_pu = float(regs[2]) + (float(regs[3]) / 65536.0)
         logging.info(f"Scaling: V_PU={self.v_pu:.6f}, I_PU={self.i_pu:.6f}")
 
+        # Detect system voltage (12V/24V/48V) from V_PU for EEPROM scaling
+        # V_PU ≈ 78 for 12V, ≈156 for 24V, ≈312 for 48V
+        if self.v_pu < 100:
+            self.system_voltage_scale = 1  # 12V system
+        elif self.v_pu < 200:
+            self.system_voltage_scale = 2  # 24V system
+        else:
+            self.system_voltage_scale = 4  # 48V system
+        logging.info(f"Detected {self.system_voltage_scale * 12}V system (EEPROM scale factor: {self.system_voltage_scale})")
+
         # Firmware version (BCD)
         ver = regs[4]
         self.firmware_version = (
@@ -1666,15 +1677,24 @@ class TriStarDriver:
 
             # EEPROM charge settings (to debug voltage override behavior and show active profile)
             # Read absorption voltage and regulation limits from EEPROM
+            # NOTE: EEPROM stores 12V-equivalent values, must multiply by system voltage scale
             eeprom_regs = self.read_input_registers(0xE000, 18)  # Read EV_absorp through Evb_ref_lim
             if eeprom_regs and len(eeprom_regs) >= 18:
-                ev_absorp = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
-                ev_float = eeprom_regs[1] * self.v_pu / 32768.0   # 0xE001
-                et_absorp = eeprom_regs[2]                        # 0xE002 (seconds, no scaling)
-                ev_float_cancel = eeprom_regs[5] * self.v_pu / 32768.0  # 0xE005
-                ev_eq = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
-                ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C)
-                evb_ref_lim = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
+                # Read 12V-equivalent values from EEPROM
+                ev_absorp_12v = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
+                ev_float_12v = eeprom_regs[1] * self.v_pu / 32768.0   # 0xE001
+                et_absorp = eeprom_regs[2]                            # 0xE002 (seconds, no scaling)
+                ev_float_cancel_12v = eeprom_regs[5] * self.v_pu / 32768.0  # 0xE005
+                ev_eq_12v = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
+                ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C, no system scale)
+                evb_ref_lim_12v = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
+
+                # Convert to actual voltages for display (multiply by system voltage scale)
+                ev_absorp = ev_absorp_12v * self.system_voltage_scale
+                ev_float = ev_float_12v * self.system_voltage_scale
+                ev_float_cancel = ev_float_cancel_12v * self.system_voltage_scale
+                ev_eq = ev_eq_12v * self.system_voltage_scale
+                evb_ref_lim = evb_ref_lim_12v * self.system_voltage_scale
 
                 self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = round(ev_absorp, 2)
                 self.dbus['/Custom/EEPROM/FloatVoltage'] = round(ev_float, 2)
@@ -2300,9 +2320,12 @@ class TriStarDriver:
 
     def _on_apply_profile_requested(self, path, value):
         """Callback when user writes to /Control/ApplyChargeProfile"""
+        logging.debug(f"Apply profile callback: path={path}, value={value}, type={type(value)}, status={self.profile_apply_status}")
         profile_name = str(value).lower().strip()
+        logging.debug(f"Parsed profile_name: '{profile_name}'")
 
         if not profile_name:
+            logging.error(f"Empty profile name after parsing")
             return False
 
         if profile_name not in ['summer', 'winter', 'custom']:
@@ -2311,8 +2334,9 @@ class TriStarDriver:
             logging.error(error_msg)
             return False
 
-        if self.profile_apply_status != 'idle':
-            error_msg = "Profile apply already in progress"
+        # Block if operation is in progress, but allow retry after success/failure
+        if self.profile_apply_status not in ['idle', 'success', 'failed']:
+            error_msg = f"Profile apply already in progress (status: {self.profile_apply_status})"
             self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
             logging.warning(error_msg)
             return False
@@ -2334,7 +2358,7 @@ class TriStarDriver:
         for attempt in range(attempts):
             sleep(0.5)
             try:
-                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1, unit=self.settings['slave_id']).registers[0]
                 if cs == expected_state:
                     elapsed = (attempt + 1) * 0.5
                     state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
@@ -2358,7 +2382,7 @@ class TriStarDriver:
         for attempt in range(attempts):
             sleep(0.5)
             try:
-                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1, unit=self.settings['slave_id']).registers[0]
                 if cs != unwanted_state:
                     elapsed = (attempt + 1) * 0.5
                     state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
@@ -2385,7 +2409,7 @@ class TriStarDriver:
                 self.client.close()
                 self.client.connect()
                 # Test that connection actually works
-                self.client.read_holding_registers(REG_V_PU, 1)
+                self.client.read_holding_registers(REG_V_PU, 1, unit=self.settings['slave_id'])
                 elapsed = (attempt + 1) * 0.5
                 logging.info(f"✓ Modbus reconnected after {elapsed:.1f}s")
                 return True
@@ -2406,6 +2430,15 @@ class TriStarDriver:
             self.profile_apply_in_progress = True
             self.main_loop_paused_reason = f"Applying charge profile '{profile_name}'"
             logging.info(f"Main update loop paused for profile apply")
+
+            # Create dedicated Modbus client for this operation
+            ip = self.settings['ip_address']
+            port = self.settings['modbus_port']
+            slave_id = self.settings['slave_id']
+            self.client = ModbusTcpClient(host=ip, port=port, timeout=2, retries=0)
+            if not self.client.connect():
+                raise Exception("Failed to connect to controller")
+            logging.debug("Modbus client connected for profile apply")
 
             self._update_profile_status("validating", 0, "")
 
@@ -2468,9 +2501,13 @@ class TriStarDriver:
 
             # Step 9: Reset controller (Morningstar recommended)
             self._update_profile_status("resetting", 70, "Resetting controller...")
-            if not self.write_coil(COIL_RESET_CTRL, True):
-                raise Exception("Failed to reset controller")
-            logging.info("Controller reset triggered, waiting for reboot...")
+            reset_result = self.write_coil(COIL_RESET_CTRL, True)
+            if reset_result:
+                logging.info("✓ Controller reset command sent successfully")
+            else:
+                # Reset coil write often fails because controller resets immediately
+                # This is expected behavior, not an error
+                logging.info("Controller reset triggered (connection closed - expected behavior)")
 
             # Step 10: Smart reconnect with polling (replaces fixed sleep + manual reconnect)
             self._update_profile_status("resetting", 75, "Waiting for controller reboot...")
@@ -2480,7 +2517,7 @@ class TriStarDriver:
             # (DISCONNECT coil should be cleared by reset, no manual re-enable needed)
             self._update_profile_status("resetting", 90, "Verifying normal operation...")
             try:
-                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1, unit=self.settings['slave_id']).registers[0]
                 state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
                 if cs == 2:  # Still DISCONNECT?!
                     logging.warning(f"⚠️ Controller still in DISCONNECT state after reset - unexpected!")
@@ -2488,7 +2525,7 @@ class TriStarDriver:
                     self.write_coil(COIL_DISCONNECT, False)
                     sleep(1)
                     # Re-check
-                    cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                    cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1, unit=self.settings['slave_id']).registers[0]
                     state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
                     logging.info(f"State after manual clear: {state_name}")
                 else:
@@ -2521,14 +2558,30 @@ class TriStarDriver:
             # Attempt to re-enable charging if we failed before reset
             # (After reset, DISCONNECT should be auto-cleared by controller)
             try:
-                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1, unit=self.settings['slave_id']).registers[0]
                 if cs == 2:  # Still DISCONNECT
                     logging.info("Attempting to re-enable charging after failure...")
                     self.write_coil(COIL_DISCONNECT, False)
             except Exception as recovery_error:
-                logging.error(f"Failed to re-enable charging: {recovery_error}")
+                # Connection errors are expected if controller reset - not a problem
+                if "Connection" in str(recovery_error) or "closed" in str(recovery_error):
+                    logging.debug(f"Cannot re-enable charging (controller likely reset): {recovery_error}")
+                else:
+                    logging.error(f"Failed to re-enable charging: {recovery_error}")
 
         finally:
+            # Close Modbus client
+            if hasattr(self, 'client') and self.client:
+                try:
+                    self.client.close()
+                    logging.debug("Modbus client closed")
+                except Exception:
+                    pass
+                self.client = None
+
+            # Reset control path so next apply will trigger (D-Bus onchangecallback only fires on value change)
+            self.dbus['/Control/ApplyChargeProfile'] = ''
+
             # ==== UNLOCK MODBUS (always, even on failure) ====
             self.profile_apply_in_progress = False
             self.main_loop_paused_reason = ""
@@ -2559,8 +2612,9 @@ class TriStarDriver:
 
         profile = {}
         for param, setting_key in key_map.items():
-            value = self.settings.get(setting_key)
-            if value is None:
+            try:
+                value = self.settings[setting_key]
+            except KeyError:
                 raise Exception(f"Setting '{setting_key}' not found")
             profile[param] = int(value) if param == 'Et_absorp' else float(value)
 
@@ -2586,7 +2640,10 @@ class TriStarDriver:
             raise Exception(f"Absorption time {et_absorp}s too short (minimum 3600s / 1 hour)")
 
     def _read_eeprom_values(self):
-        """Read current EEPROM charge parameter values from TriStar"""
+        """
+        Read current EEPROM charge parameter values from TriStar
+        Returns actual voltages (converted from 12V-equivalent stored in EEPROM)
+        """
         reg_map = {
             'EV_absorp': REG_EEPROM_EV_ABSORP,
             'EV_float': REG_EEPROM_EV_FLOAT,
@@ -2596,11 +2653,13 @@ class TriStarDriver:
 
         values = {}
         for param, addr in reg_map.items():
-            raw = self.client.read_holding_registers(addr, 1).registers[0]
+            raw = self.client.read_holding_registers(addr, 1, unit=self.settings['slave_id']).registers[0]
             if param == 'Et_absorp':
                 values[param] = raw  # Seconds, no scaling
             else:
-                values[param] = round(raw * self.v_pu * (2**-15), 2)
+                # EEPROM stores 12V-equivalent, convert to actual voltage
+                voltage_12v = raw * self.v_pu * (2**-15)
+                values[param] = round(voltage_12v * self.system_voltage_scale, 2)
 
         return values
 
@@ -2622,7 +2681,10 @@ class TriStarDriver:
         return changes
 
     def _write_eeprom_parameter(self, param, value):
-        """Write single EEPROM parameter"""
+        """
+        Write single EEPROM parameter
+        Converts actual voltage to 12V-equivalent before writing to EEPROM
+        """
         reg_map = {
             'EV_absorp': REG_EEPROM_EV_ABSORP,
             'EV_float': REG_EEPROM_EV_FLOAT,
@@ -2635,14 +2697,19 @@ class TriStarDriver:
         if param == 'Et_absorp':
             raw_value = int(value)
         else:
-            # Scale voltage to raw register value
-            raw_value = int(value / (self.v_pu * (2**-15)))
+            # Convert actual voltage to 12V-equivalent for EEPROM storage
+            voltage_12v = value / self.system_voltage_scale
+            # Scale to raw register value (use round() not int() for proper rounding)
+            raw_value = round(voltage_12v / (self.v_pu * (2**-15)))
 
-        logging.info(f"Writing {param} = {value} (raw: {raw_value}) to EEPROM register 0x{addr:04X}")
-        self.client.write_register(addr, raw_value)
+        logging.info(f"Writing {param} = {value} (12V-eq: {value / self.system_voltage_scale if param != 'Et_absorp' else 'N/A'}, raw: {raw_value}) to EEPROM register 0x{addr:04X}")
+        self.client.write_register(addr, raw_value, unit=self.settings['slave_id'])
 
     def _verify_eeprom_writes(self, changes):
-        """Verify written values match expected"""
+        """
+        Verify written values match expected
+        Converts from 12V-equivalent stored in EEPROM to actual voltage for comparison
+        """
         for param, expected_value in changes.items():
             reg_map = {
                 'EV_absorp': REG_EEPROM_EV_ABSORP,
@@ -2652,14 +2719,16 @@ class TriStarDriver:
             }
 
             addr = reg_map[param]
-            raw = self.client.read_holding_registers(addr, 1).registers[0]
+            raw = self.client.read_holding_registers(addr, 1, unit=self.settings['slave_id']).registers[0]
 
             if param == 'Et_absorp':
                 actual_value = raw
                 if actual_value != expected_value:
                     raise Exception(f"Verification failed for {param}: expected {expected_value}, got {actual_value}")
             else:
-                actual_value = round(raw * self.v_pu * (2**-15), 2)
+                # Convert from 12V-equivalent to actual voltage
+                voltage_12v = raw * self.v_pu * (2**-15)
+                actual_value = round(voltage_12v * self.system_voltage_scale, 2)
                 if abs(actual_value - expected_value) > 0.1:
                     raise Exception(f"Verification failed for {param}: expected {expected_value:.2f}V, got {actual_value:.2f}V")
 
@@ -2707,7 +2776,7 @@ class TriStarDriver:
                 sleep(2)
                 self.client.connect()
                 # Test connection
-                self.client.read_holding_registers(REG_V_PU, 1)
+                self.client.read_holding_registers(REG_V_PU, 1, unit=self.settings['slave_id'])
                 logging.info("Modbus reconnected successfully")
                 return
             except Exception as e:

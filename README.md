@@ -17,11 +17,11 @@ My Venus OS is connected to Home Assistant where I expose all the extra features
 
 ---
 
-## Recent Updates (v2.24)
+## Recent Updates (v2.26)
 
+✅ **Charge Profile Management** - Switch between summer/winter/custom profiles with safe EEPROM programming
+✅ **Automatic Voltage Scaling** - Auto-detect 12V/24V/48V systems for precise EEPROM writes
 ✅ **Voltage Override System** - Battery top-charging with automatic tail current detection
-✅ **Cumulative Time Tracking** - Tolerates brief voltage dips (Home Assistant pattern)
-✅ **Nightly Reset** - Prevents stuck charging sessions (configurable hour)
 ✅ **31-Day History** - Daily max/min tracking with state persistence
 ✅ **EEPROM Counters** - Lifetime kWh from TriStar's internal registers
 
@@ -104,6 +104,55 @@ dbus -y com.victronenergy.settings /Settings/TristarMPPT/MaxVoltageOverrideVolta
 
 ---
 
+## Charge Profile Management (Quick Example)
+
+Switch between seasonal charging profiles with safe EEPROM programming:
+
+```bash
+# Apply summer profile (lower voltage, shorter absorption)
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "summer"
+
+# Apply winter profile (higher voltage, longer absorption)
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "winter"
+
+# Monitor progress
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/ApplyStatus GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/ProgressPercent GetValue
+
+# Check active EEPROM values
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/AbsorptionVoltage GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/FloatVoltage GetValue
+```
+
+**Default profiles:**
+- **Summer:** 28.4V absorption, 27.2V float, 7200s (2h) absorption time
+- **Winter:** 28.8V absorption, 27.6V float, 9000s (2.5h) absorption time
+- **Custom:** 28.6V absorption, 27.4V float, 8400s (2.3h) absorption time (user-configurable)
+
+**Customize profiles via D-Bus Settings:**
+```bash
+# Configure custom profile for your specific battery
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage SetValue 28.8
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage SetValue 27.6
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime SetValue 9000
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage SetValue 26.4
+
+# Apply the customized profile
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "custom"
+```
+
+**Safety features:**
+- Automatic DISCONNECT before EEPROM writes
+- Backup creation before changes (saved to `/data/dbus-tristar/eeprom_backups/`)
+- Verification after every write (0.1V tolerance)
+- Automatic controller reset
+- Thread-safe operation (main loop paused during writes)
+- Automatic voltage scaling for 12V/24V/48V systems
+
+📚 **Full documentation:** [DRIVER_DOCUMENTATION.md](DRIVER_DOCUMENTATION.md) - Complete charge profile reference
+
+---
+
 ## Verification
 
 ```bash
@@ -139,6 +188,7 @@ Your TriStar MPPT will appear as a **Solar Charger** in:
 - ✅ Full VRM Portal integration
 
 ### Control
+- ✅ **Charge profile management** - Switch between summer/winter/custom profiles with safe EEPROM programming
 - ✅ **Voltage override** - Top-charge to configurable voltage (e.g., 28.7V)
 - ✅ **Automatic battery full detection** - Tail current monitoring with configurable thresholds
 - ✅ **Mode control** - Enable/disable charging via D-Bus
@@ -187,7 +237,7 @@ Your TriStar MPPT will appear as a **Solar Charger** in:
 
 ```
 dbus-tsmppt/
-├── dbus_tristar.py              # Main driver (v2.24)
+├── dbus_tristar.py              # Main driver (v2.26)
 ├── install.sh                   # Installation script
 ├── README.md                    # This file (overview)
 ├── DRIVER_DOCUMENTATION.md      # Complete technical reference (📚 READ THIS!)
