@@ -20,6 +20,7 @@ import time as time_module
 from datetime import datetime, time as dt_time, timezone, timedelta
 import json
 from pathlib import Path
+import threading
 
 # pymodbus v2.x (Venus OS) vs v3.x compatibility
 try:
@@ -32,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.24"  # Fix: Remove t_bulk_ms reset from nightly, use local time, add CONFIG section
+VERSION = "2.25"  # Add EEPROM charge profile management (summer/winter/custom)
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -126,6 +127,12 @@ COIL_DISCONNECT = 2        # Charger disconnect
 COIL_RESET_CTRL = 255      # Reset controller (momentary, only when dark!)
 COIL_RESET_COMM = 4351     # Reset comm server (momentary)
 
+# EEPROM registers (read/write) - Charge settings
+REG_EEPROM_EV_ABSORP = 0xE000        # Absorption voltage
+REG_EEPROM_EV_FLOAT = 0xE001         # Float voltage
+REG_EEPROM_ET_ABSORP = 0xE002        # Absorption time (seconds)
+REG_EEPROM_EV_FLOAT_CANCEL = 0xE005  # Float cancel voltage
+
 # Charge states
 CS_NIGHT = 3
 CS_BULK = 5
@@ -213,6 +220,21 @@ class TriStarDriver:
                 'max_voltage_override_time': ['/Settings/TristarMPPT/MaxVoltageOverrideTime', CONFIG['max_voltage_override_time'], 0, 86400],
                 'battery_full_current': ['/Settings/TristarMPPT/BatteryFullCurrent', CONFIG['battery_full_current'], 0.0, 100.0],
                 'tail_current_time': ['/Settings/TristarMPPT/TailCurrentTime', CONFIG['tail_current_time'], 0, 3600],
+                # Charge profile settings (Summer)
+                'profile_summer_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionVoltage', 28.4, 26.0, 32.0],
+                'profile_summer_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatVoltage', 27.2, 24.0, 30.0],
+                'profile_summer_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionTime', 7200, 3600, 36000],
+                'profile_summer_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatCancelVoltage', 26.0, 22.0, 28.0],
+                # Charge profile settings (Winter)
+                'profile_winter_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionVoltage', 28.8, 26.0, 32.0],
+                'profile_winter_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatVoltage', 27.6, 24.0, 30.0],
+                'profile_winter_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionTime', 9000, 3600, 36000],
+                'profile_winter_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatCancelVoltage', 26.4, 22.0, 28.0],
+                # Charge profile settings (Custom)
+                'profile_custom_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage', 28.6, 26.0, 32.0],
+                'profile_custom_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage', 27.4, 24.0, 30.0],
+                'profile_custom_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime', 8400, 3600, 36000],
+                'profile_custom_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage', 26.2, 22.0, 28.0],
             },
             eventCallback=self._setting_changed
         )
@@ -327,6 +349,14 @@ class TriStarDriver:
 
         # Track which history days have D-Bus paths created (for dynamic path creation)
         self.history_days_created = set()  # Set of day indices (1-29) that have paths
+
+        # Charge profile management (EEPROM-based permanent settings)
+        self.charge_profiles = self._load_charge_profiles()
+        self.profile_apply_status = "idle"
+        self.profile_apply_error = ""
+        self.profile_apply_progress = 0
+        self.profile_apply_in_progress = False  # Lock flag for Modbus exclusivity
+        self.main_loop_paused_reason = ""
 
         # Note: State will be saved on first update (initialization) or at midnight rollover
         # No need to save here - we haven't changed anything yet!
@@ -700,9 +730,19 @@ class TriStarDriver:
 
         # EEPROM charge settings (configured absorption/equalize voltages and limits)
         s.add_path('/Custom/EEPROM/AbsorptionVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/Custom/EEPROM/FloatVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/Custom/EEPROM/AbsorptionTime', 0, writeable=False, gettextcallback=lambda p, v: f"{v}s")
+        s.add_path('/Custom/EEPROM/FloatCancelVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/EEPROM/EqualizeVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/EEPROM/TempCompensation', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V/C")
         s.add_path('/Custom/EEPROM/MaxRegulationLimit', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+
+        # Charge profile management (EEPROM profile apply control and status)
+        s.add_path('/Control/ApplyChargeProfile', '', writeable=True, onchangecallback=self._on_apply_profile_requested)
+        s.add_path('/Custom/ChargeProfile/ApplyStatus', 'idle', writeable=False)
+        s.add_path('/Custom/ChargeProfile/LastApplied', '', writeable=False)
+        s.add_path('/Custom/ChargeProfile/LastError', '', writeable=False)
+        s.add_path('/Custom/ChargeProfile/ProgressPercent', 0, writeable=False)
 
         # EEPROM lifetime charge counters (TriStar's internal counters)
         s.add_path('/Custom/EEPROM/ChargeKwhResetable', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}kWh")
@@ -1484,6 +1524,13 @@ class TriStarDriver:
 
         self.last_update_time = current_time
 
+        # Check if profile apply is in progress (avoid Modbus collision)
+        if self.profile_apply_in_progress:
+            # Main loop paused - profile apply thread has exclusive Modbus access
+            if self.main_loop_paused_reason:
+                logging.debug(f"Main loop paused: {self.main_loop_paused_reason}")
+            return True  # Continue timer, but skip Modbus operations
+
         try:
             if not self.initialized:
                 logging.info("Not initialized, attempting to initialize...")
@@ -1617,16 +1664,22 @@ class TriStarDriver:
             self.dbus['/Custom/Battery/CurrentFast'] = round(self._to_signed(reg(REG_I_CC_FAST)) * self.i_pu / 32768.0, 2)
             self.dbus['/Custom/Battery/VoltageSlow'] = round(reg(REG_V_BAT_SLOW) * self.v_pu / 32768.0, 2)
 
-            # EEPROM charge settings (to debug voltage override behavior)
+            # EEPROM charge settings (to debug voltage override behavior and show active profile)
             # Read absorption voltage and regulation limits from EEPROM
             eeprom_regs = self.read_input_registers(0xE000, 18)  # Read EV_absorp through Evb_ref_lim
             if eeprom_regs and len(eeprom_regs) >= 18:
                 ev_absorp = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
+                ev_float = eeprom_regs[1] * self.v_pu / 32768.0   # 0xE001
+                et_absorp = eeprom_regs[2]                        # 0xE002 (seconds, no scaling)
+                ev_float_cancel = eeprom_regs[5] * self.v_pu / 32768.0  # 0xE005
                 ev_eq = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
                 ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C)
                 evb_ref_lim = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
 
                 self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = round(ev_absorp, 2)
+                self.dbus['/Custom/EEPROM/FloatVoltage'] = round(ev_float, 2)
+                self.dbus['/Custom/EEPROM/AbsorptionTime'] = et_absorp
+                self.dbus['/Custom/EEPROM/FloatCancelVoltage'] = round(ev_float_cancel, 2)
                 self.dbus['/Custom/EEPROM/EqualizeVoltage'] = round(ev_eq, 2)
                 self.dbus['/Custom/EEPROM/TempCompensation'] = round(ev_tempcomp, 4)
                 self.dbus['/Custom/EEPROM/MaxRegulationLimit'] = round(evb_ref_lim, 2)
@@ -2173,6 +2226,496 @@ class TriStarDriver:
                     logging.info("Nightly reset completed successfully")
                 else:
                     logging.error("Nightly comm server reset failed - will retry tomorrow")
+
+    # ========================================================================
+    # Charge Profile Management (EEPROM)
+    # ========================================================================
+
+    def _load_charge_profiles(self):
+        """Load charge profiles from JSON file"""
+        profile_file = Path("/data/dbus-tristar/charge_profiles.json")
+
+        default_profiles = {
+            "version": 1,
+            "last_applied_profile": "",
+            "last_applied_timestamp": "",
+            "profiles": {
+                "summer": {
+                    "EV_absorp": 28.4,
+                    "EV_float": 27.2,
+                    "Et_absorp": 7200,
+                    "EV_float_cancel": 26.0
+                },
+                "winter": {
+                    "EV_absorp": 28.8,
+                    "EV_float": 27.6,
+                    "Et_absorp": 9000,
+                    "EV_float_cancel": 26.4
+                },
+                "custom": {
+                    "EV_absorp": 28.6,
+                    "EV_float": 27.4,
+                    "Et_absorp": 8400,
+                    "EV_float_cancel": 26.2
+                }
+            }
+        }
+
+        try:
+            if profile_file.exists():
+                with open(profile_file, 'r') as f:
+                    profiles = json.load(f)
+                    # Merge with defaults for any missing profiles
+                    for profile_name in default_profiles["profiles"]:
+                        if profile_name not in profiles.get("profiles", {}):
+                            profiles["profiles"][profile_name] = default_profiles["profiles"][profile_name]
+                    return profiles
+        except Exception as e:
+            logging.error(f"Failed to load charge profiles: {e}")
+
+        # Create default file if it doesn't exist
+        try:
+            profile_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(profile_file, 'w') as f:
+                json.dump(default_profiles, f, indent=2)
+            logging.info(f"Created default charge profiles: {profile_file}")
+        except Exception as e:
+            logging.error(f"Failed to create default charge profiles file: {e}")
+
+        return default_profiles
+
+    def _save_charge_profiles(self):
+        """Save charge profiles to JSON file (atomic write)"""
+        profile_file = Path("/data/dbus-tristar/charge_profiles.json")
+        temp_file = profile_file.with_suffix('.tmp')
+
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(self.charge_profiles, f, indent=2)
+            temp_file.replace(profile_file)
+        except Exception as e:
+            logging.error(f"Failed to save charge profiles: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+
+    def _on_apply_profile_requested(self, path, value):
+        """Callback when user writes to /Control/ApplyChargeProfile"""
+        profile_name = str(value).lower().strip()
+
+        if not profile_name:
+            return False
+
+        if profile_name not in ['summer', 'winter', 'custom']:
+            error_msg = f"Invalid profile: {profile_name}. Must be 'summer', 'winter', or 'custom'"
+            self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
+            logging.error(error_msg)
+            return False
+
+        if self.profile_apply_status != 'idle':
+            error_msg = "Profile apply already in progress"
+            self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
+            logging.warning(error_msg)
+            return False
+
+        # Start async profile apply operation
+        logging.info(f"Starting charge profile apply: {profile_name}")
+        threading.Thread(target=self._apply_charge_profile_async,
+                        args=(profile_name,),
+                        daemon=True).start()
+
+        return True
+
+    def _wait_for_charge_state(self, expected_state, timeout_sec=5, step_name=""):
+        """
+        Poll for specific charge state with intelligent retry
+        Returns True if state reached, False if timeout
+        """
+        attempts = int(timeout_sec / 0.5)
+        for attempt in range(attempts):
+            sleep(0.5)
+            try:
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                if cs == expected_state:
+                    elapsed = (attempt + 1) * 0.5
+                    state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
+                    logging.info(f"{step_name}Charge state {state_name} reached after {elapsed:.1f}s")
+                    return True
+            except Exception as e:
+                if attempt % 4 == 0:  # Log every 2 seconds
+                    logging.debug(f"Polling charge state: {e}")
+                continue
+
+        # Timeout
+        logging.warning(f"{step_name}Charge state {expected_state} not reached after {timeout_sec}s")
+        return False
+
+    def _wait_for_charge_state_not(self, unwanted_state, timeout_sec=5, step_name=""):
+        """
+        Poll until charge state changes from unwanted_state
+        Returns True if state changed, False if timeout
+        """
+        attempts = int(timeout_sec / 0.5)
+        for attempt in range(attempts):
+            sleep(0.5)
+            try:
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                if cs != unwanted_state:
+                    elapsed = (attempt + 1) * 0.5
+                    state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
+                    logging.info(f"{step_name}Charge state changed to {state_name} after {elapsed:.1f}s")
+                    return True
+            except Exception as e:
+                if attempt % 4 == 0:
+                    logging.debug(f"Polling charge state: {e}")
+                continue
+
+        logging.warning(f"{step_name}Charge state still {unwanted_state} after {timeout_sec}s")
+        return False
+
+    def _smart_reconnect(self, timeout_sec=20):
+        """
+        Poll for Modbus reconnect after controller reset with intelligent retry
+        Returns True if reconnected, raises Exception if timeout
+        """
+        attempts = int(timeout_sec / 0.5)
+
+        for attempt in range(attempts):
+            sleep(0.5)
+            try:
+                self.client.close()
+                self.client.connect()
+                # Test that connection actually works
+                self.client.read_holding_registers(REG_V_PU, 1)
+                elapsed = (attempt + 1) * 0.5
+                logging.info(f"✓ Modbus reconnected after {elapsed:.1f}s")
+                return True
+            except Exception as e:
+                if attempt % 4 == 0:  # Log every 2 seconds
+                    logging.debug(f"Reconnect attempt {attempt//2 + 1}: {e}")
+                continue
+
+        raise Exception(f"Failed to reconnect to controller after {timeout_sec}s")
+
+    def _apply_charge_profile_async(self, profile_name):
+        """
+        Async operation to apply charge profile to EEPROM
+        Follows Morningstar recommended procedure with intelligent retry
+        """
+        try:
+            # ==== LOCK MODBUS (prevent collision with main update loop) ====
+            self.profile_apply_in_progress = True
+            self.main_loop_paused_reason = f"Applying charge profile '{profile_name}'"
+            logging.info(f"Main update loop paused for profile apply")
+
+            self._update_profile_status("validating", 0, "")
+
+            # Step 1: Get profile from Settings
+            profile = self._get_profile_from_settings(profile_name)
+            logging.info(f"Profile '{profile_name}': {profile}")
+
+            # Step 2: Validate relationships
+            self._validate_profile(profile)
+
+            # Step 3: Read current EEPROM values
+            self._update_profile_status("validating", 10, "Reading current EEPROM...")
+            current_eeprom = self._read_eeprom_values()
+            logging.info(f"Current EEPROM: {current_eeprom}")
+
+            # Step 4: Compare and filter (only write changed values)
+            changes = self._compare_profiles(profile, current_eeprom)
+
+            if not changes:
+                logging.info(f"Profile '{profile_name}' already matches EEPROM, no changes needed")
+                self._update_profile_status("success", 100, "")
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self.dbus['/Custom/ChargeProfile/LastApplied'] = f"{profile_name} (no changes) at {timestamp}"
+                self._save_charge_profiles()
+                return
+
+            logging.info(f"Will write {len(changes)} EEPROM parameter(s): {list(changes.keys())}")
+
+            # Step 5: Backup current EEPROM
+            self._update_profile_status("validating", 20, "Backing up current values...")
+            backup = self._backup_eeprom(current_eeprom, f"before_profile_{profile_name}")
+
+            # Step 6: Disable charging (DISCONNECT) with intelligent wait
+            self._update_profile_status("disconnecting", 30, "Disconnecting charger...")
+            if not self.write_coil(COIL_DISCONNECT, True):
+                raise Exception("Failed to set DISCONNECT coil")
+
+            # Poll for DISCONNECT state (max 5 seconds)
+            if not self._wait_for_charge_state(2, timeout_sec=5, step_name="DISCONNECT: "):
+                logging.warning("DISCONNECT state not confirmed, but continuing anyway...")
+
+            # Step 7: Write EEPROM parameters (in safe order: lowest voltage first)
+            self._update_profile_status("writing", 40, "Writing EEPROM parameters...")
+            write_order = ['EV_float_cancel', 'EV_float', 'EV_absorp', 'Et_absorp']
+
+            written_count = 0
+            for param in write_order:
+                if param in changes:
+                    self._write_eeprom_parameter(param, changes[param])
+                    written_count += 1
+                    progress = 40 + int((written_count / len(changes)) * 20)
+                    self._update_profile_status("writing", progress, f"Wrote {written_count}/{len(changes)} parameters...")
+                    sleep(0.2)
+
+            sleep(1)  # EEPROM write cycle completion
+
+            # Step 8: Verify writes
+            self._update_profile_status("writing", 60, "Verifying writes...")
+            self._verify_eeprom_writes(changes)
+
+            # Step 9: Reset controller (Morningstar recommended)
+            self._update_profile_status("resetting", 70, "Resetting controller...")
+            if not self.write_coil(COIL_RESET_CTRL, True):
+                raise Exception("Failed to reset controller")
+            logging.info("Controller reset triggered, waiting for reboot...")
+
+            # Step 10: Smart reconnect with polling (replaces fixed sleep + manual reconnect)
+            self._update_profile_status("resetting", 75, "Waiting for controller reboot...")
+            self._smart_reconnect(timeout_sec=20)
+
+            # Step 11: Verify controller resumed normal operation
+            # (DISCONNECT coil should be cleared by reset, no manual re-enable needed)
+            self._update_profile_status("resetting", 90, "Verifying normal operation...")
+            try:
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
+                if cs == 2:  # Still DISCONNECT?!
+                    logging.warning(f"⚠️ Controller still in DISCONNECT state after reset - unexpected!")
+                    logging.warning("Attempting to clear DISCONNECT as fallback...")
+                    self.write_coil(COIL_DISCONNECT, False)
+                    sleep(1)
+                    # Re-check
+                    cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                    state_name = CHARGE_STATE_TEXT.get(cs, f"Unknown({cs})")
+                    logging.info(f"State after manual clear: {state_name}")
+                else:
+                    logging.info(f"✓ Controller resumed normal operation (state: {state_name})")
+            except Exception as e:
+                logging.warning(f"Could not verify charge state after reset: {e}")
+
+            # Step 12: Read back and update active EEPROM display
+            self._update_profile_status("resetting", 95, "Verifying final values...")
+            final_eeprom = self._read_eeprom_values()
+            self._update_active_eeprom_display(final_eeprom)
+
+            # Step 13: Success!
+            self._update_profile_status("success", 100, "")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.dbus['/Custom/ChargeProfile/LastApplied'] = f"{profile_name} at {timestamp}"
+
+            # Update profiles JSON
+            self.charge_profiles['last_applied_profile'] = profile_name
+            self.charge_profiles['last_applied_timestamp'] = timestamp
+            self._save_charge_profiles()
+
+            logging.info(f"✅ Charge profile '{profile_name}' applied successfully ({len(changes)} changes)")
+
+        except Exception as e:
+            error_msg = str(e)
+            logging.error(f"❌ Failed to apply charge profile '{profile_name}': {error_msg}")
+            self._update_profile_status("failed", self.profile_apply_progress, error_msg)
+
+            # Attempt to re-enable charging if we failed before reset
+            # (After reset, DISCONNECT should be auto-cleared by controller)
+            try:
+                cs = self.client.read_holding_registers(REG_CHARGE_STATE, 1).registers[0]
+                if cs == 2:  # Still DISCONNECT
+                    logging.info("Attempting to re-enable charging after failure...")
+                    self.write_coil(COIL_DISCONNECT, False)
+            except Exception as recovery_error:
+                logging.error(f"Failed to re-enable charging: {recovery_error}")
+
+        finally:
+            # ==== UNLOCK MODBUS (always, even on failure) ====
+            self.profile_apply_in_progress = False
+            self.main_loop_paused_reason = ""
+            logging.info("Main update loop resumed")
+
+    def _update_profile_status(self, status, progress, error):
+        """Update D-Bus status paths for profile apply operation"""
+        self.profile_apply_status = status
+        self.profile_apply_progress = progress
+        self.profile_apply_error = error
+
+        self.dbus['/Custom/ChargeProfile/ApplyStatus'] = status
+        self.dbus['/Custom/ChargeProfile/ProgressPercent'] = progress
+        if error:
+            self.dbus['/Custom/ChargeProfile/LastError'] = error
+
+    def _get_profile_from_settings(self, profile_name):
+        """Read profile values from D-Bus Settings"""
+        profile_cap = profile_name.capitalize()
+
+        # Read from SettingsDevice (values are already loaded in self.settings)
+        key_map = {
+            'EV_absorp': f'profile_{profile_name}_absorption_v',
+            'EV_float': f'profile_{profile_name}_float_v',
+            'Et_absorp': f'profile_{profile_name}_absorption_time',
+            'EV_float_cancel': f'profile_{profile_name}_float_cancel_v',
+        }
+
+        profile = {}
+        for param, setting_key in key_map.items():
+            value = self.settings.get(setting_key)
+            if value is None:
+                raise Exception(f"Setting '{setting_key}' not found")
+            profile[param] = int(value) if param == 'Et_absorp' else float(value)
+
+        return profile
+
+    def _validate_profile(self, profile):
+        """Validate profile parameter relationships"""
+        ev_float = profile['EV_float']
+        ev_absorp = profile['EV_absorp']
+        ev_float_cancel = profile['EV_float_cancel']
+        et_absorp = profile['Et_absorp']
+
+        if ev_float >= ev_absorp:
+            raise Exception(f"Float voltage ({ev_float}V) must be < Absorption voltage ({ev_absorp}V)")
+
+        if ev_float_cancel >= ev_float:
+            raise Exception(f"Float cancel voltage ({ev_float_cancel}V) must be < Float voltage ({ev_float}V)")
+
+        if not (26.0 <= ev_absorp <= 32.0):
+            raise Exception(f"Absorption voltage {ev_absorp}V out of safe range (26-32V)")
+
+        if et_absorp < 3600:
+            raise Exception(f"Absorption time {et_absorp}s too short (minimum 3600s / 1 hour)")
+
+    def _read_eeprom_values(self):
+        """Read current EEPROM charge parameter values from TriStar"""
+        reg_map = {
+            'EV_absorp': REG_EEPROM_EV_ABSORP,
+            'EV_float': REG_EEPROM_EV_FLOAT,
+            'Et_absorp': REG_EEPROM_ET_ABSORP,
+            'EV_float_cancel': REG_EEPROM_EV_FLOAT_CANCEL,
+        }
+
+        values = {}
+        for param, addr in reg_map.items():
+            raw = self.client.read_holding_registers(addr, 1).registers[0]
+            if param == 'Et_absorp':
+                values[param] = raw  # Seconds, no scaling
+            else:
+                values[param] = round(raw * self.v_pu * (2**-15), 2)
+
+        return values
+
+    def _compare_profiles(self, new_profile, current_eeprom):
+        """Return only parameters that differ from current EEPROM"""
+        changes = {}
+        tolerance = 0.05  # ±0.05V tolerance for voltage comparisons
+
+        for param, new_value in new_profile.items():
+            current_value = current_eeprom.get(param)
+
+            if param == 'Et_absorp':
+                if current_value != new_value:
+                    changes[param] = new_value
+            else:
+                if abs(current_value - new_value) > tolerance:
+                    changes[param] = new_value
+
+        return changes
+
+    def _write_eeprom_parameter(self, param, value):
+        """Write single EEPROM parameter"""
+        reg_map = {
+            'EV_absorp': REG_EEPROM_EV_ABSORP,
+            'EV_float': REG_EEPROM_EV_FLOAT,
+            'Et_absorp': REG_EEPROM_ET_ABSORP,
+            'EV_float_cancel': REG_EEPROM_EV_FLOAT_CANCEL,
+        }
+
+        addr = reg_map[param]
+
+        if param == 'Et_absorp':
+            raw_value = int(value)
+        else:
+            # Scale voltage to raw register value
+            raw_value = int(value / (self.v_pu * (2**-15)))
+
+        logging.info(f"Writing {param} = {value} (raw: {raw_value}) to EEPROM register 0x{addr:04X}")
+        self.client.write_register(addr, raw_value)
+
+    def _verify_eeprom_writes(self, changes):
+        """Verify written values match expected"""
+        for param, expected_value in changes.items():
+            reg_map = {
+                'EV_absorp': REG_EEPROM_EV_ABSORP,
+                'EV_float': REG_EEPROM_EV_FLOAT,
+                'Et_absorp': REG_EEPROM_ET_ABSORP,
+                'EV_float_cancel': REG_EEPROM_EV_FLOAT_CANCEL,
+            }
+
+            addr = reg_map[param]
+            raw = self.client.read_holding_registers(addr, 1).registers[0]
+
+            if param == 'Et_absorp':
+                actual_value = raw
+                if actual_value != expected_value:
+                    raise Exception(f"Verification failed for {param}: expected {expected_value}, got {actual_value}")
+            else:
+                actual_value = round(raw * self.v_pu * (2**-15), 2)
+                if abs(actual_value - expected_value) > 0.1:
+                    raise Exception(f"Verification failed for {param}: expected {expected_value:.2f}V, got {actual_value:.2f}V")
+
+            logging.info(f"✓ Verified {param} = {actual_value}")
+
+    def _backup_eeprom(self, eeprom_values, reason):
+        """Create timestamped EEPROM backup"""
+        backup_dir = Path("/data/dbus-tristar/eeprom_backups")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_file = backup_dir / f"backup_{timestamp}.json"
+
+        backup_data = {
+            "timestamp": datetime.now().isoformat(),
+            "reason": reason,
+            "values": eeprom_values
+        }
+
+        with open(backup_file, 'w') as f:
+            json.dump(backup_data, f, indent=2)
+
+        # Keep only last 10 backups
+        backups = sorted(backup_dir.glob("backup_*.json"))
+        if len(backups) > 10:
+            for old_backup in backups[:-10]:
+                old_backup.unlink()
+
+        logging.info(f"EEPROM backup saved: {backup_file}")
+        return backup_data
+
+    def _update_active_eeprom_display(self, eeprom_values):
+        """Update D-Bus paths showing active EEPROM values"""
+        self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = eeprom_values.get('EV_absorp', 0.0)
+        self.dbus['/Custom/EEPROM/FloatVoltage'] = eeprom_values.get('EV_float', 0.0)
+        self.dbus['/Custom/EEPROM/AbsorptionTime'] = eeprom_values.get('Et_absorp', 0)
+        self.dbus['/Custom/EEPROM/FloatCancelVoltage'] = eeprom_values.get('EV_float_cancel', 0.0)
+
+    def _reconnect_modbus(self):
+        """Re-establish Modbus connection after reset"""
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                self.client.close()
+                sleep(2)
+                self.client.connect()
+                # Test connection
+                self.client.read_holding_registers(REG_V_PU, 1)
+                logging.info("Modbus reconnected successfully")
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logging.warning(f"Reconnect attempt {attempt+1} failed: {e}")
+                    sleep(3)
+                else:
+                    raise Exception(f"Failed to reconnect after {max_retries} attempts: {e}")
 
     @staticmethod
     def _to_signed(value):
