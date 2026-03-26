@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.25"  # Add EEPROM charge profile management + fix 12V/24V/48V voltage scaling
+VERSION = "2.28"  # Fix: Preserve time values (absorption/float/equalize) across controller resets
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -336,6 +336,11 @@ class TriStarDriver:
         self.last_daily_register_value = 0
         self.first_update_done = False  # Flag to detect very first update after restart
 
+        # Daily Wh offset (for handling controller resets before midnight)
+        # When controller resets, REG_WHC_DAILY goes to 0, but we're still in valid period
+        # Offset = Wh before reset, so actual = offset + register
+        self.daily_wh_offset = self.state.get('daily_wh_offset', 0.0)
+
         # Load voltage override state (for backwards compatibility)
         if 'voltage_override' not in self.state:
             self.state['voltage_override'] = {
@@ -408,13 +413,17 @@ class TriStarDriver:
             "last_update": datetime.utcnow().isoformat() + "Z",
             "current_date": self._get_local_date(),
             "daily_register_has_reset": True,  # Assume Modbus valid initially
+            "daily_wh_offset": 0.0,  # Offset for controller resets before midnight
             "today": {
                 "max_battery_current": 0.0,
                 "max_power": 0.0,
                 "max_pv_voltage": 0.0,
                 "max_battery_voltage": 0.0,
                 "min_battery_voltage": 999.0,
-                "time_bulk": 0
+                "time_bulk": 0,
+                "time_absorption": 0,
+                "time_float": 0,
+                "time_equalize": 0
             },
             "history": [],  # Will grow to 30 days (Day 1-30)
             "lifetime": {
@@ -555,9 +564,9 @@ class TriStarDriver:
                     "min_battery_voltage": self.state['today']['min_battery_voltage'] if self.state['today']['min_battery_voltage'] < 999 else 0.0,
                     "max_battery_current": self.state['today']['max_battery_current'],
                     "time_bulk": int(self.t_bulk_ms / (1000 * 60)),
-                    "time_absorption": self.dbus['/History/Daily/0/TimeInAbsorption'],
-                    "time_float": self.dbus['/History/Daily/0/TimeInFloat'],
-                    "time_equalize": self.dbus['/History/Daily/0/TimeInEqualize']
+                    "time_absorption": self.state['today']['time_absorption'],
+                    "time_float": self.state['today']['time_float'],
+                    "time_equalize": self.state['today']['time_equalize']
                 }
 
                 # Add yesterday's production to total
@@ -591,7 +600,10 @@ class TriStarDriver:
                     "max_pv_voltage": 0.0,
                     "max_battery_voltage": 0.0,
                     "min_battery_voltage": 999.0,
-                    "time_bulk": 0
+                    "time_bulk": 0,
+                    "time_absorption": 0,
+                    "time_float": 0,
+                    "time_equalize": 0
                 }
 
                 # Reset register flag (expect register to reset when sun comes up)
@@ -603,6 +615,11 @@ class TriStarDriver:
                 self.state['voltage_override']['time_used_today'] = 0
                 self.state['voltage_override']['current_date'] = current_date
                 logging.info("Voltage override time counter reset for new day")
+
+                # Reset daily Wh offset for new day
+                self.daily_wh_offset = 0.0
+                self.state['daily_wh_offset'] = 0.0
+                logging.info("Daily Wh offset reset for new day")
 
                 # Save state to file
                 self._save_state()
@@ -1815,17 +1832,36 @@ class TriStarDriver:
             # Expose raw Modbus value on D-Bus for debugging/logging
             self.dbus['/Custom/Daily/ChargeWh'] = current_daily_wh
 
-            # Detect register reset - TWO cases:
-            # 1. Value decreased (normal day: 690 → 10 Wh)
-            # 2. Increased from 0 (no charging yesterday: 0 → 10 Wh)
+            # Detect register reset - THREE cases:
+            # 1. Value decreased during valid period (daily_register_has_reset=True) = CONTROLLER RESET
+            # 2. Value decreased post-midnight (daily_register_has_reset=False) = SUNRISE RESET
+            # 3. Increased from 0 (no charging yesterday: 0 → 10 Wh)
             if current_daily_wh < self.last_daily_register_value:
-                # Case 1: Register decreased = reset happened (normal sunrise)
-                self.daily_register_has_reset = True
-                self.state['daily_register_has_reset'] = True
-                logging.info(f"Detected REG_WHC_DAILY reset (decrease): {self.last_daily_register_value} → {current_daily_wh} Wh")
-                logging.info(f"  Before: total={self.state['total_yield_kwh']:.3f} kWh, daily will become {current_daily_wh/1000.0:.3f} kWh")
+                if self.daily_register_has_reset:
+                    # Case 1: Controller reset during valid period (before midnight)
+                    # Register dropped from X → 0, but we're still in same day
+                    # Save current total as offset, keep using it
+                    decrease = self.last_daily_register_value - current_daily_wh
+                    if decrease > 50:  # Significant drop (>50 Wh), likely controller reset
+                        current_total_wh = self.daily_wh_offset + self.last_daily_register_value
+                        self.daily_wh_offset = current_total_wh
+                        self.state['daily_wh_offset'] = self.daily_wh_offset
+                        logging.warning(f"⚠️ Controller reset detected! REG_WHC_DAILY: {self.last_daily_register_value} → {current_daily_wh} Wh")
+                        logging.warning(f"  Setting offset to {self.daily_wh_offset:.1f} Wh to preserve today's data")
+                        logging.warning(f"  Future daily_wh = {self.daily_wh_offset:.1f} + REG_WHC_DAILY")
+                    else:
+                        # Small decrease, might be noise - treat as normal sunrise reset
+                        self.daily_register_has_reset = True
+                        self.state['daily_register_has_reset'] = True
+                        logging.info(f"Detected REG_WHC_DAILY reset (decrease): {self.last_daily_register_value} → {current_daily_wh} Wh")
+                else:
+                    # Case 2: Sunrise reset (post-midnight, pre-sunrise period)
+                    self.daily_register_has_reset = True
+                    self.state['daily_register_has_reset'] = True
+                    logging.info(f"Detected REG_WHC_DAILY reset (sunrise): {self.last_daily_register_value} → {current_daily_wh} Wh")
+                    logging.info(f"  Before: total={self.state['total_yield_kwh']:.3f} kWh, daily will become {current_daily_wh/1000.0:.3f} kWh")
             elif self.last_daily_register_value == 0 and current_daily_wh > 0 and not self.daily_register_has_reset:
-                # Case 2: Register increased from 0 = charging started after zero-yield day
+                # Case 3: Register increased from 0 = charging started after zero-yield day
                 # Safe because: if register is updating (0 → X), it's not frozen
                 self.daily_register_has_reset = True
                 self.state['daily_register_has_reset'] = True
@@ -1846,12 +1882,15 @@ class TriStarDriver:
 
             self.last_daily_register_value = current_daily_wh
 
-            # If post-midnight but pre-sunrise (register hasn't reset), use 0
+            # Calculate daily yield with offset (for controller resets before midnight)
             if not self.daily_register_has_reset:
                 daily_kwh = 0.0  # Don't use yesterday's stale value
                 logging.debug("Post-midnight, pre-sunrise: using 0 for daily yield")
             else:
-                daily_kwh = current_daily_wh / 1000.0
+                # Apply offset (normally 0, but set when controller reset happens)
+                daily_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0
+                if self.daily_wh_offset > 0:
+                    logging.debug(f"Daily yield with offset: {self.daily_wh_offset:.1f} + {current_daily_wh} Wh = {daily_kwh:.3f} kWh")
 
             # Check for midnight (date changed) - do this BEFORE updating history paths
             self._check_midnight_rollover(daily_kwh)
@@ -1867,7 +1906,7 @@ class TriStarDriver:
             if not self.daily_register_has_reset:
                 daily_kwh = 0.0  # Post-midnight pre-sunrise: use 0
             else:
-                daily_kwh = current_daily_wh / 1000.0  # Sun is up: use Modbus
+                daily_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0  # Sun is up: use Modbus + offset
 
             # Log if recalculation changed the value (indicates flag changed during this cycle)
             if abs(daily_kwh - old_daily_kwh) > 0.001:
@@ -1880,28 +1919,51 @@ class TriStarDriver:
             self.state['today']['max_pv_voltage'] = self.daily_max_pv_voltage
             self.state['today']['max_battery_voltage'] = self.daily_max_battery_voltage
             self.state['today']['min_battery_voltage'] = self.daily_min_battery_voltage
+            # Save time values from Modbus when valid (will be preserved across controller resets)
+            if self.daily_register_has_reset:
+                self.state['today']['time_absorption'] = reg(REG_T_ABS) // 60  # Convert seconds to minutes
+                self.state['today']['time_float'] = reg(REG_T_FLOAT) // 60
+                self.state['today']['time_equalize'] = reg(REG_T_EQ_DAILY) // 60
             self.state['today']['time_bulk'] = int(self.t_bulk_ms / (1000 * 60))  # Convert ms to minutes
 
             # History - Day 0 (today, live values)
             self.dbus['/History/Daily/0/Yield'] = round(daily_kwh, 2)
 
             if self.daily_register_has_reset:
-                # Register has valid data for today - use Modbus values
+                # Register has valid data for today - use max(state.json, Modbus)
+                # This preserves values across controller resets (which reset Modbus registers)
+                modbus_max_power = reg(REG_POUT_MAX_DAILY) * self.i_pu * self.v_pu / 131072.0
+                modbus_max_pv_v = reg(REG_V_PV_MAX) * self.v_pu / 32768.0
+                modbus_max_batt_v = reg(REG_V_BAT_MAX) * self.v_pu / 32768.0
+                modbus_min_batt_v = reg(REG_V_BAT_MIN) * self.v_pu / 32768.0
+
                 self.dbus['/History/Daily/0/MaxPower'] = round(
-                    reg(REG_POUT_MAX_DAILY) * self.i_pu * self.v_pu / 131072.0, 0
+                    max(self.state['today']['max_power'], modbus_max_power), 0
                 )
                 self.dbus['/History/Daily/0/MaxPvVoltage'] = round(
-                    reg(REG_V_PV_MAX) * self.v_pu / 32768.0, 2
+                    max(self.state['today']['max_pv_voltage'], modbus_max_pv_v), 2
                 )
                 self.dbus['/History/Daily/0/MaxBatteryVoltage'] = round(
-                    reg(REG_V_BAT_MAX) * self.v_pu / 32768.0, 2
+                    max(self.state['today']['max_battery_voltage'], modbus_max_batt_v), 2
                 )
+                # Min uses min() instead of max()
+                state_min = self.state['today']['min_battery_voltage'] if self.state['today']['min_battery_voltage'] < 999 else 99.0
                 self.dbus['/History/Daily/0/MinBatteryVoltage'] = round(
-                    reg(REG_V_BAT_MIN) * self.v_pu / 32768.0, 2
+                    min(state_min, modbus_min_batt_v), 2
                 )
-                self.dbus['/History/Daily/0/TimeInAbsorption'] = reg(REG_T_ABS) // 60
-                self.dbus['/History/Daily/0/TimeInFloat'] = reg(REG_T_FLOAT) // 60
-                self.dbus['/History/Daily/0/TimeInEqualize'] = reg(REG_T_EQ_DAILY) // 60
+                # Time values: use max(state.json, Modbus) to preserve across controller resets
+                modbus_time_abs = reg(REG_T_ABS) // 60
+                modbus_time_float = reg(REG_T_FLOAT) // 60
+                modbus_time_eq = reg(REG_T_EQ_DAILY) // 60
+                self.dbus['/History/Daily/0/TimeInAbsorption'] = max(
+                    self.state['today']['time_absorption'], modbus_time_abs
+                )
+                self.dbus['/History/Daily/0/TimeInFloat'] = max(
+                    self.state['today']['time_float'], modbus_time_float
+                )
+                self.dbus['/History/Daily/0/TimeInEqualize'] = max(
+                    self.state['today']['time_equalize'], modbus_time_eq
+                )
             else:
                 # Modbus has stale data - use today's values from state.json instead
                 # (state is updated every 5 min, so these are recent values)
@@ -1910,10 +1972,10 @@ class TriStarDriver:
                 self.dbus['/History/Daily/0/MaxBatteryVoltage'] = round(self.state['today']['max_battery_voltage'], 2)
                 min_batt = self.state['today']['min_battery_voltage']
                 self.dbus['/History/Daily/0/MinBatteryVoltage'] = round(min_batt, 2) if min_batt < 999 else 0.0
-                # Time values: Set to 0 when Modbus is stale (post-midnight, pre-sunrise)
-                self.dbus['/History/Daily/0/TimeInAbsorption'] = 0
-                self.dbus['/History/Daily/0/TimeInFloat'] = 0
-                self.dbus['/History/Daily/0/TimeInEqualize'] = 0
+                # Time values: Use state.json when Modbus is stale (preserves yesterday's values until sunrise)
+                self.dbus['/History/Daily/0/TimeInAbsorption'] = self.state['today']['time_absorption']
+                self.dbus['/History/Daily/0/TimeInFloat'] = self.state['today']['time_float']
+                self.dbus['/History/Daily/0/TimeInEqualize'] = self.state['today']['time_equalize']
 
             # These values are tracked by us (reset at midnight), so always use them
             self.dbus['/History/Daily/0/MaxBatteryCurrent'] = round(self.daily_max_battery_current, 2)
