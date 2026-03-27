@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.28"  # Fix: Preserve time values (absorption/float/equalize) across controller resets
+VERSION = "2.29"  # Fix: Save state before controller reset; reduce EEPROM tolerance to 0.01V
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -2561,6 +2561,10 @@ class TriStarDriver:
             self._update_profile_status("writing", 60, "Verifying writes...")
             self._verify_eeprom_writes(changes)
 
+            # Step 8.5: Save state before controller reset (preserve daily statistics)
+            self._save_state()
+            logging.info("✓ State saved before controller reset")
+
             # Step 9: Reset controller (Morningstar recommended)
             self._update_profile_status("resetting", 70, "Resetting controller...")
             reset_result = self.write_coil(COIL_RESET_CTRL, True)
@@ -2728,7 +2732,7 @@ class TriStarDriver:
     def _compare_profiles(self, new_profile, current_eeprom):
         """Return only parameters that differ from current EEPROM"""
         changes = {}
-        tolerance = 0.05  # ±0.05V tolerance for voltage comparisons
+        tolerance = 0.01  # ±0.01V tolerance for voltage comparisons
 
         for param, new_value in new_profile.items():
             current_value = current_eeprom.get(param)
@@ -2791,7 +2795,7 @@ class TriStarDriver:
                 # Convert from 12V-equivalent to actual voltage
                 voltage_12v = raw * self.v_pu * (2**-15)
                 actual_value = round(voltage_12v * self.system_voltage_scale, 2)
-                if abs(actual_value - expected_value) > 0.1:
+                if abs(actual_value - expected_value) > 0.05:
                     raise Exception(f"Verification failed for {param}: expected {expected_value:.2f}V, got {actual_value:.2f}V")
 
             logging.info(f"✓ Verified {param} = {actual_value}")
@@ -2868,11 +2872,21 @@ def main():
 
     # Setup graceful shutdown handlers
     mainloop = None
+    driver = None
 
     def cleanup_and_exit(signum=None, frame=None):
         """Handle shutdown signals gracefully"""
         sig_name = signal.Signals(signum).name if signum else "unknown"
         logging.info(f"Received signal {sig_name} - shutting down gracefully...")
+
+        # Save state before shutdown
+        if driver:
+            try:
+                driver._save_state()
+                logging.info("✓ State saved before shutdown")
+            except Exception as e:
+                logging.error(f"Failed to save state on shutdown: {e}")
+
         if mainloop:
             mainloop.quit()
         sys.exit(0)
