@@ -1,0 +1,51 @@
+Subject: TriStar MPPT - Questions about Daily Register Behavior and EEPROM Programming
+
+Dear Morningstar Technical Support,
+
+I am developing a driver for the TriStar MPPT solar charge controller using Modbus TCP communication. It is to be used on an off-grid cottage and should optimize the lifetime of Lithium Ion batteries. I am using TriStar MPPT Model: TS-MPPT-60 Firmware: Controller v1.1.42 and Server v9.25 and Serial #10170296 for the development.
+
+
+During development, I have encountered some behaviors/questions that are not fully documented in the official Modbus specification, and I would appreciate clarification on the following points:
+
+
+1. I would like to be able to program EEPROM parameters "on-the-fly" when needed, ideally also when the panels are in production. My guess is that best practice to avoid damage to the controller is to:
+
+* Enable controller DISCONNECT
+* Write to EEPROM
+* Reset controller
+
+Questions:
+- Is the above the best practice?
+- Is it OK to do this when in production?
+- Is reset needed or can I just enable DISCONNECT before writing to EEPROM and then disable DISCONNECT after writing?
+
+
+2. DAILY REGISTER RESET BEHAVIOR
+   When the controller is reset (via COIL_RESET_CTRL), I observe that the daily energy registers (REG_WHC_DAILY at 0x003C) and daily max/min registers (REG_POUT_MAX_DAILY, REG_V_PV_MAX, REG_V_BAT_MAX, REG_V_BAT_MIN) and time accumulation registers (REG_T_ABS at 0x004D, REG_T_FLOAT at 0x004F, REG_T_EQ_DAILY at 0x004E) are all cleared to zero.
+
+   Question:
+   - Is this the expected behavior?
+
+3. I experience that after a long time (month or longer) the comm server can stop responding, and I need to restart the controller. To avoid this I have set the driver to reset the comm server every night.
+
+Question:
+- Is this a known problem or is it only my test-rig that is malfunctioning?
+
+4. When not doing other operations on Modbus, I am now polling 56 registers (0x0018 to 0x004F, addresses 24 to 79) every 5 seconds.
+
+Question:
+- What is the maximum polling frequency I can use and still have stable results?
+
+5. I am experiencing that my controller is measuring the battery voltage with a 0.2V difference compared to a Victron BMV shunt. The TriStar is set up with voltage sense.
+
+Question:
+- Are there any ways to calibrate the voltage measurement on the TriStar? 
+
+
+Thank you for your assistance. Any clarification on these points would be greatly helpful for ensuring robust and accurate monitoring.
+
+Best regards,
+Erik
+
+
+

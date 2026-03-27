@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.29"  # Fix: Save state before controller reset; reduce EEPROM tolerance to 0.01V
+VERSION = "2.30"  # Optimize: Remove EEPROM polling from main loop (read at startup + every 30 min)
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -272,6 +272,11 @@ class TriStarDriver:
 
         # Exponential backoff on persistent failures
         self.backoff_factor = 1  # Multiplier for poll interval (1x, 2x, 4x)
+
+        # EEPROM read optimization (avoid reading every poll per Morningstar recommendation)
+        self.eeprom_refresh_needed = True   # Flag to refresh charge settings (read at startup)
+        self.eeprom_kwh_counter = 0         # Counter for lifetime kWh reads
+        self.eeprom_kwh_interval = 360      # Read every 30 min (360 × 5s = 1800s)
 
         # Voltage override control
         self.pending_voltage_override = None       # Register value to write (None = disabled)
@@ -1536,6 +1541,10 @@ class TriStarDriver:
         logging.info(f"  Serial: {self.serial_number}")
         logging.info(f"  HW: v{self.hardware_version}, FW: {self.firmware_version}")
 
+        # Read EEPROM values at startup (charge settings + lifetime kWh)
+        self._read_eeprom_charge_settings()
+        self._read_eeprom_lifetime_kwh()
+
         self.initialized = True
         return True
 
@@ -1692,45 +1701,8 @@ class TriStarDriver:
             self.dbus['/Custom/Battery/CurrentFast'] = round(self._to_signed(reg(REG_I_CC_FAST)) * self.i_pu / 32768.0, 2)
             self.dbus['/Custom/Battery/VoltageSlow'] = round(reg(REG_V_BAT_SLOW) * self.v_pu / 32768.0, 2)
 
-            # EEPROM charge settings (to debug voltage override behavior and show active profile)
-            # Read absorption voltage and regulation limits from EEPROM
-            # NOTE: EEPROM stores 12V-equivalent values, must multiply by system voltage scale
-            eeprom_regs = self.read_input_registers(0xE000, 18)  # Read EV_absorp through Evb_ref_lim
-            if eeprom_regs and len(eeprom_regs) >= 18:
-                # Read 12V-equivalent values from EEPROM
-                ev_absorp_12v = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
-                ev_float_12v = eeprom_regs[1] * self.v_pu / 32768.0   # 0xE001
-                et_absorp = eeprom_regs[2]                            # 0xE002 (seconds, no scaling)
-                ev_float_cancel_12v = eeprom_regs[5] * self.v_pu / 32768.0  # 0xE005
-                ev_eq_12v = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
-                ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C, no system scale)
-                evb_ref_lim_12v = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
-
-                # Convert to actual voltages for display (multiply by system voltage scale)
-                ev_absorp = ev_absorp_12v * self.system_voltage_scale
-                ev_float = ev_float_12v * self.system_voltage_scale
-                ev_float_cancel = ev_float_cancel_12v * self.system_voltage_scale
-                ev_eq = ev_eq_12v * self.system_voltage_scale
-                evb_ref_lim = evb_ref_lim_12v * self.system_voltage_scale
-
-                self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = round(ev_absorp, 2)
-                self.dbus['/Custom/EEPROM/FloatVoltage'] = round(ev_float, 2)
-                self.dbus['/Custom/EEPROM/AbsorptionTime'] = et_absorp
-                self.dbus['/Custom/EEPROM/FloatCancelVoltage'] = round(ev_float_cancel, 2)
-                self.dbus['/Custom/EEPROM/EqualizeVoltage'] = round(ev_eq, 2)
-                self.dbus['/Custom/EEPROM/TempCompensation'] = round(ev_tempcomp, 4)
-                self.dbus['/Custom/EEPROM/MaxRegulationLimit'] = round(evb_ref_lim, 2)
-
-            # EEPROM lifetime kWh counters (TriStar's internal accumulators)
-            # Read registers 0xE086-0xE087 (EkWhc_r and EkWhc_t)
-            kwh_regs = self.read_input_registers(0xE086, 2)
-            if kwh_regs and len(kwh_regs) >= 2:
-                # Spec page 15: kWhc registers already in kWh units (no scaling needed)
-                ekwhc_r = kwh_regs[0]  # 0xE086 - Resetable kWh
-                ekwhc_t = kwh_regs[1]  # 0xE087 - Total kWh (lifetime)
-
-                self.dbus['/Custom/EEPROM/ChargeKwhResetable'] = round(ekwhc_r, 1)
-                self.dbus['/Custom/EEPROM/ChargeKwhTotal'] = round(ekwhc_t, 1)
+            # EEPROM reads REMOVED from main poll loop (per Morningstar recommendation)
+            # Now called conditionally at end of update() - see _read_eeprom_charge_settings() and _read_eeprom_lifetime_kwh()
 
             # Internal power supply - use FIXED scaling constants per spec (NOT v_pu!)
             # Spec: MS-002582_v11.pdf, registers 31-35 use fixed voltage scaling
@@ -2244,6 +2216,20 @@ class TriStarDriver:
         except Exception as e:
             logging.error(f"Update error: {e}", exc_info=True)
 
+        # Conditional EEPROM reads (outside try/except to not block on EEPROM errors)
+        # Per Morningstar: "not reading the EEPROM registers helps prevent [comm server] issues"
+
+        # Read lifetime kWh every 30 minutes (not critical for real-time monitoring)
+        self.eeprom_kwh_counter += 1
+        if self.eeprom_kwh_counter >= self.eeprom_kwh_interval:
+            self._read_eeprom_lifetime_kwh()
+            self.eeprom_kwh_counter = 0
+
+        # Read charge settings on-demand (after EEPROM write or at startup)
+        if self.eeprom_refresh_needed:
+            self._read_eeprom_charge_settings()
+            self.eeprom_refresh_needed = False
+
         return True  # Continue timer
 
     def _check_nightly_reset(self):
@@ -2614,6 +2600,9 @@ class TriStarDriver:
             self.charge_profiles['last_applied_timestamp'] = timestamp
             self._save_charge_profiles()
 
+            # Flag main loop to refresh EEPROM charge settings on next update
+            self.eeprom_refresh_needed = True
+
             logging.info(f"✅ Charge profile '{profile_name}' applied successfully ({len(changes)} changes)")
 
         except Exception as e:
@@ -2825,6 +2814,61 @@ class TriStarDriver:
 
         logging.info(f"EEPROM backup saved: {backup_file}")
         return backup_data
+
+    def _read_eeprom_charge_settings(self):
+        """
+        Read EEPROM charge settings and update D-Bus paths
+        Called: at startup, after EEPROM write, or on-demand
+        NOT called in main poll loop (per Morningstar recommendation)
+        """
+        eeprom_regs = self.read_input_registers(0xE000, 18)  # Read EV_absorp through Evb_ref_lim
+        if eeprom_regs and len(eeprom_regs) >= 18:
+            # Read 12V-equivalent values from EEPROM
+            ev_absorp_12v = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
+            ev_float_12v = eeprom_regs[1] * self.v_pu / 32768.0   # 0xE001
+            et_absorp = eeprom_regs[2]                            # 0xE002 (seconds, no scaling)
+            ev_float_cancel_12v = eeprom_regs[5] * self.v_pu / 32768.0  # 0xE005
+            ev_eq_12v = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
+            ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C, no system scale)
+            evb_ref_lim_12v = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
+
+            # Convert to actual voltages for display (multiply by system voltage scale)
+            ev_absorp = ev_absorp_12v * self.system_voltage_scale
+            ev_float = ev_float_12v * self.system_voltage_scale
+            ev_float_cancel = ev_float_cancel_12v * self.system_voltage_scale
+            ev_eq = ev_eq_12v * self.system_voltage_scale
+            evb_ref_lim = evb_ref_lim_12v * self.system_voltage_scale
+
+            self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = round(ev_absorp, 2)
+            self.dbus['/Custom/EEPROM/FloatVoltage'] = round(ev_float, 2)
+            self.dbus['/Custom/EEPROM/AbsorptionTime'] = et_absorp
+            self.dbus['/Custom/EEPROM/FloatCancelVoltage'] = round(ev_float_cancel, 2)
+            self.dbus['/Custom/EEPROM/EqualizeVoltage'] = round(ev_eq, 2)
+            self.dbus['/Custom/EEPROM/TempCompensation'] = round(ev_tempcomp, 4)
+            self.dbus['/Custom/EEPROM/MaxRegulationLimit'] = round(evb_ref_lim, 2)
+
+            logging.debug("EEPROM charge settings refreshed")
+        else:
+            logging.warning("Failed to read EEPROM charge settings")
+
+    def _read_eeprom_lifetime_kwh(self):
+        """
+        Read EEPROM lifetime kWh counters and update D-Bus paths
+        Called: at startup, every 30 minutes
+        NOT called in main poll loop (per Morningstar recommendation)
+        """
+        kwh_regs = self.read_input_registers(0xE086, 2)
+        if kwh_regs and len(kwh_regs) >= 2:
+            # Spec page 15: kWhc registers already in kWh units (no scaling needed)
+            ekwhc_r = kwh_regs[0]  # 0xE086 - Resetable kWh
+            ekwhc_t = kwh_regs[1]  # 0xE087 - Total kWh (lifetime)
+
+            self.dbus['/Custom/EEPROM/ChargeKwhResetable'] = round(ekwhc_r, 1)
+            self.dbus['/Custom/EEPROM/ChargeKwhTotal'] = round(ekwhc_t, 1)
+
+            logging.debug(f"EEPROM lifetime kWh refreshed: {ekwhc_t} kWh total")
+        else:
+            logging.warning("Failed to read EEPROM lifetime kWh")
 
     def _update_active_eeprom_display(self, eeprom_values):
         """Update D-Bus paths showing active EEPROM values"""
