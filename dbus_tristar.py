@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.30"  # Optimize: Remove EEPROM polling from main loop (read at startup + every 30 min)
+VERSION = "2.33"  # Fix: Save today.yield in state.json as safety net against driver/controller restart
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -223,18 +223,18 @@ class TriStarDriver:
                 # Charge profile settings (Summer)
                 'profile_summer_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionVoltage', 28.4, 26.0, 32.0],
                 'profile_summer_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatVoltage', 27.2, 24.0, 30.0],
-                'profile_summer_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionTime', 7200, 3600, 36000],
-                'profile_summer_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatCancelVoltage', 26.0, 22.0, 28.0],
+                'profile_summer_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionTime', 7200, 0, 86400],
+                'profile_summer_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatCancelVoltage', 26.0, 0.0, 32.0],
                 # Charge profile settings (Winter)
                 'profile_winter_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionVoltage', 28.8, 26.0, 32.0],
                 'profile_winter_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatVoltage', 27.6, 24.0, 30.0],
-                'profile_winter_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionTime', 9000, 3600, 36000],
-                'profile_winter_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatCancelVoltage', 26.4, 22.0, 28.0],
+                'profile_winter_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionTime', 9000, 0, 86400],
+                'profile_winter_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatCancelVoltage', 26.4, 0.0, 32.0],
                 # Charge profile settings (Custom)
                 'profile_custom_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage', 28.6, 26.0, 32.0],
                 'profile_custom_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage', 27.4, 24.0, 30.0],
-                'profile_custom_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime', 8400, 3600, 36000],
-                'profile_custom_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage', 26.2, 22.0, 28.0],
+                'profile_custom_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime', 8400, 0, 86400],
+                'profile_custom_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage', 26.2, 0.0, 32.0],
             },
             eventCallback=self._setting_changed
         )
@@ -420,6 +420,7 @@ class TriStarDriver:
             "daily_register_has_reset": True,  # Assume Modbus valid initially
             "daily_wh_offset": 0.0,  # Offset for controller resets before midnight
             "today": {
+                "yield": 0.0,
                 "max_battery_current": 0.0,
                 "max_power": 0.0,
                 "max_pv_voltage": 0.0,
@@ -500,16 +501,16 @@ class TriStarDriver:
             history = self.state.get('history', [])
 
             # Update DaysAvailable: number of historical days + today (day 0)
-            days_available = min(len(history) + 1, 31)  # Max 31 days (Day 0-30)
+            days_available = min(len(history) + 1, 31)  # Max 31 days (Day 0 + Days 1-30)
             self.dbus['/History/Overall/DaysAvailable'] = days_available
 
             # Only create paths for days that have actual data (days 1-30)
-            # This prevents Venus OS from thinking we have 31 days when we only have 1
+            # Venus OS shows 31 days total: Day 0 (today) + Days 1-30 (historical)
             for history_index in range(len(history)):
                 day_index = history_index + 1  # history[0] = day 1 (yesterday)
 
-                if day_index > 29:
-                    break  # Only support up to 29 historical days
+                if day_index > 30:
+                    break  # Only support up to 30 historical days
 
                 # Create D-Bus paths for this day if not already created
                 if day_index not in self.history_days_created:
@@ -600,6 +601,7 @@ class TriStarDriver:
 
                 # Reset today's values in state as well
                 self.state['today'] = {
+                    "yield": 0.0,
                     "max_battery_current": 0.0,
                     "max_power": 0.0,
                     "max_pv_voltage": 0.0,
@@ -1860,9 +1862,14 @@ class TriStarDriver:
                 logging.debug("Post-midnight, pre-sunrise: using 0 for daily yield")
             else:
                 # Apply offset (normally 0, but set when controller reset happens)
-                daily_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0
+                modbus_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0
+                # Use max(state.json, Modbus) - protects against driver restart losing daily_wh_offset
+                saved_kwh = self.state['today'].get('yield', 0.0)
+                daily_kwh = max(saved_kwh, modbus_kwh)
                 if self.daily_wh_offset > 0:
-                    logging.debug(f"Daily yield with offset: {self.daily_wh_offset:.1f} + {current_daily_wh} Wh = {daily_kwh:.3f} kWh")
+                    logging.debug(f"Daily yield with offset: {self.daily_wh_offset:.1f} + {current_daily_wh} Wh = {modbus_kwh:.3f} kWh")
+                if daily_kwh > modbus_kwh:
+                    logging.debug(f"Daily yield: using saved value {saved_kwh:.3f} kWh (Modbus: {modbus_kwh:.3f} kWh)")
 
             # Check for midnight (date changed) - do this BEFORE updating history paths
             self._check_midnight_rollover(daily_kwh)
@@ -1878,7 +1885,8 @@ class TriStarDriver:
             if not self.daily_register_has_reset:
                 daily_kwh = 0.0  # Post-midnight pre-sunrise: use 0
             else:
-                daily_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0  # Sun is up: use Modbus + offset
+                modbus_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0
+                daily_kwh = max(self.state['today'].get('yield', 0.0), modbus_kwh)
 
             # Log if recalculation changed the value (indicates flag changed during this cycle)
             if abs(daily_kwh - old_daily_kwh) > 0.001:
@@ -1886,6 +1894,8 @@ class TriStarDriver:
 
             # Update state['today'] with current daily values (AFTER midnight check, so reset works correctly)
             # This will be saved every 5 minutes to preserve values across restarts
+            if self.daily_register_has_reset:
+                self.state['today']['yield'] = daily_kwh  # Only save when Modbus is valid
             self.state['today']['max_battery_current'] = self.daily_max_battery_current
             self.state['today']['max_power'] = self.daily_max_power
             self.state['today']['max_pv_voltage'] = self.daily_max_pv_voltage
@@ -2685,14 +2695,16 @@ class TriStarDriver:
         if ev_float >= ev_absorp:
             raise Exception(f"Float voltage ({ev_float}V) must be < Absorption voltage ({ev_absorp}V)")
 
-        if ev_float_cancel >= ev_float:
+        # Allow 0 for float_cancel (disables the function)
+        if ev_float_cancel > 0 and ev_float_cancel >= ev_float:
             raise Exception(f"Float cancel voltage ({ev_float_cancel}V) must be < Float voltage ({ev_float}V)")
 
         if not (26.0 <= ev_absorp <= 32.0):
             raise Exception(f"Absorption voltage {ev_absorp}V out of safe range (26-32V)")
 
-        if et_absorp < 3600:
-            raise Exception(f"Absorption time {et_absorp}s too short (minimum 3600s / 1 hour)")
+        # Allow any absorption time from 0 (disabled) to 24 hours
+        if not (0 <= et_absorp <= 86400):
+            raise Exception(f"Absorption time {et_absorp}s out of range (0-86400s / 0-24 hours)")
 
     def _read_eeprom_values(self):
         """
