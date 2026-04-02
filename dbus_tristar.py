@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.33"  # Fix: Save today.yield in state.json as safety net against driver/controller restart
+VERSION = "2.34"  # Fix: Add time offsets for absorption/float/equalize across controller resets
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -346,6 +346,11 @@ class TriStarDriver:
         # Offset = Wh before reset, so actual = offset + register
         self.daily_wh_offset = self.state.get('daily_wh_offset', 0.0)
 
+        # Daily time offsets (same principle as daily_wh_offset, but for charge stage timers)
+        self.time_abs_offset = self.state.get('time_abs_offset', 0)
+        self.time_float_offset = self.state.get('time_float_offset', 0)
+        self.time_eq_offset = self.state.get('time_eq_offset', 0)
+
         # Load voltage override state (for backwards compatibility)
         if 'voltage_override' not in self.state:
             self.state['voltage_override'] = {
@@ -419,6 +424,9 @@ class TriStarDriver:
             "current_date": self._get_local_date(),
             "daily_register_has_reset": True,  # Assume Modbus valid initially
             "daily_wh_offset": 0.0,  # Offset for controller resets before midnight
+            "time_abs_offset": 0,    # Absorption time before last controller reset
+            "time_float_offset": 0,  # Float time before last controller reset
+            "time_eq_offset": 0,     # Equalize time before last controller reset
             "today": {
                 "yield": 0.0,
                 "max_battery_current": 0.0,
@@ -627,6 +635,14 @@ class TriStarDriver:
                 self.daily_wh_offset = 0.0
                 self.state['daily_wh_offset'] = 0.0
                 logging.info("Daily Wh offset reset for new day")
+
+                # Reset daily time offsets for new day
+                self.time_abs_offset = 0
+                self.time_float_offset = 0
+                self.time_eq_offset = 0
+                self.state['time_abs_offset'] = 0
+                self.state['time_float_offset'] = 0
+                self.state['time_eq_offset'] = 0
 
                 # Save state to file
                 self._save_state()
@@ -1823,6 +1839,15 @@ class TriStarDriver:
                         logging.warning(f"⚠️ Controller reset detected! REG_WHC_DAILY: {self.last_daily_register_value} → {current_daily_wh} Wh")
                         logging.warning(f"  Setting offset to {self.daily_wh_offset:.1f} Wh to preserve today's data")
                         logging.warning(f"  Future daily_wh = {self.daily_wh_offset:.1f} + REG_WHC_DAILY")
+
+                        # Save time offsets (Modbus time registers also reset to 0 on controller reset)
+                        self.time_abs_offset = self.state['today'].get('time_absorption', 0)
+                        self.time_float_offset = self.state['today'].get('time_float', 0)
+                        self.time_eq_offset = self.state['today'].get('time_equalize', 0)
+                        self.state['time_abs_offset'] = self.time_abs_offset
+                        self.state['time_float_offset'] = self.time_float_offset
+                        self.state['time_eq_offset'] = self.time_eq_offset
+                        logging.warning(f"  Time offsets set: abs={self.time_abs_offset}m, float={self.time_float_offset}m, eq={self.time_eq_offset}m")
                     else:
                         # Small decrease, might be noise - treat as normal sunrise reset
                         self.daily_register_has_reset = True
@@ -1901,11 +1926,11 @@ class TriStarDriver:
             self.state['today']['max_pv_voltage'] = self.daily_max_pv_voltage
             self.state['today']['max_battery_voltage'] = self.daily_max_battery_voltage
             self.state['today']['min_battery_voltage'] = self.daily_min_battery_voltage
-            # Save time values from Modbus when valid (will be preserved across controller resets)
+            # Save time values from Modbus when valid (offset + register = total for the day)
             if self.daily_register_has_reset:
-                self.state['today']['time_absorption'] = reg(REG_T_ABS) // 60  # Convert seconds to minutes
-                self.state['today']['time_float'] = reg(REG_T_FLOAT) // 60
-                self.state['today']['time_equalize'] = reg(REG_T_EQ_DAILY) // 60
+                self.state['today']['time_absorption'] = self.time_abs_offset + reg(REG_T_ABS) // 60
+                self.state['today']['time_float'] = self.time_float_offset + reg(REG_T_FLOAT) // 60
+                self.state['today']['time_equalize'] = self.time_eq_offset + reg(REG_T_EQ_DAILY) // 60
             self.state['today']['time_bulk'] = int(self.t_bulk_ms / (1000 * 60))  # Convert ms to minutes
 
             # History - Day 0 (today, live values)
@@ -1933,19 +1958,10 @@ class TriStarDriver:
                 self.dbus['/History/Daily/0/MinBatteryVoltage'] = round(
                     min(state_min, modbus_min_batt_v), 2
                 )
-                # Time values: use max(state.json, Modbus) to preserve across controller resets
-                modbus_time_abs = reg(REG_T_ABS) // 60
-                modbus_time_float = reg(REG_T_FLOAT) // 60
-                modbus_time_eq = reg(REG_T_EQ_DAILY) // 60
-                self.dbus['/History/Daily/0/TimeInAbsorption'] = max(
-                    self.state['today']['time_absorption'], modbus_time_abs
-                )
-                self.dbus['/History/Daily/0/TimeInFloat'] = max(
-                    self.state['today']['time_float'], modbus_time_float
-                )
-                self.dbus['/History/Daily/0/TimeInEqualize'] = max(
-                    self.state['today']['time_equalize'], modbus_time_eq
-                )
+                # Time values: offset + Modbus (same principle as daily_wh_offset for yield)
+                self.dbus['/History/Daily/0/TimeInAbsorption'] = self.time_abs_offset + reg(REG_T_ABS) // 60
+                self.dbus['/History/Daily/0/TimeInFloat'] = self.time_float_offset + reg(REG_T_FLOAT) // 60
+                self.dbus['/History/Daily/0/TimeInEqualize'] = self.time_eq_offset + reg(REG_T_EQ_DAILY) // 60
             else:
                 # Modbus has stale data - use today's values from state.json instead
                 # (state is updated every 5 min, so these are recent values)
