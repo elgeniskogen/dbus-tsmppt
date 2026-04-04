@@ -128,31 +128,71 @@ ExcessPowerThreshold      = 100            (Minimum excess power in W, range: -1
 ```
 
 #### Charge Profile Settings
+
+Seven profiles in two categories. All four parameters per profile, all ranges identical.
+
+**Rest profiles** (seasonal maintenance, auto-applied at 02:30 when season changes):
 ```
-ChargeProfiles/Summer/AbsorptionVoltage     = 28.4  (V, range: 26.0-32.0)
-ChargeProfiles/Summer/FloatVoltage          = 27.2  (V, range: 24.0-30.0)
-ChargeProfiles/Summer/AbsorptionTime        = 7200  (seconds, range: 3600-36000)
-ChargeProfiles/Summer/FloatCancelVoltage    = 26.0  (V, range: 22.0-28.0)
+ChargeProfiles/SummerRest/AbsorptionVoltage   = 27.4  (V, ~55-60% SOC, range: 22.0-32.0)
+ChargeProfiles/SummerRest/FloatVoltage        = 27.2  (V, ~45-50% SOC, range: 22.0-32.0)
+ChargeProfiles/SummerRest/AbsorptionTime      =  900  (seconds, range: 0-86400)
+ChargeProfiles/SummerRest/FloatExitTime       = 7200  (seconds, range: 0-86400)
 
-ChargeProfiles/Winter/AbsorptionVoltage     = 28.8  (V, range: 26.0-32.0)
-ChargeProfiles/Winter/FloatVoltage          = 27.6  (V, range: 24.0-30.0)
-ChargeProfiles/Winter/AbsorptionTime        = 9000  (seconds, range: 3600-36000)
-ChargeProfiles/Winter/FloatCancelVoltage    = 26.4  (V, range: 22.0-28.0)
+ChargeProfiles/AutumnRest/AbsorptionVoltage   = 27.8  (V, ~65-70% SOC, range: 22.0-32.0)
+ChargeProfiles/AutumnRest/FloatVoltage        = 27.6  (V, ~60-65% SOC, range: 22.0-32.0)
+ChargeProfiles/AutumnRest/AbsorptionTime      = 1800  (seconds, range: 0-86400)
+ChargeProfiles/AutumnRest/FloatExitTime       = 5400  (seconds, range: 0-86400)
 
-ChargeProfiles/Custom/AbsorptionVoltage     = 28.6  (V, range: 26.0-32.0)
-ChargeProfiles/Custom/FloatVoltage          = 27.4  (V, range: 24.0-30.0)
-ChargeProfiles/Custom/AbsorptionTime        = 8400  (seconds, range: 3600-36000)
-ChargeProfiles/Custom/FloatCancelVoltage    = 26.2  (V, range: 22.0-28.0)
+ChargeProfiles/WinterRest/AbsorptionVoltage   = 28.0  (V, ~75-80% SOC, range: 22.0-32.0)
+ChargeProfiles/WinterRest/FloatVoltage        = 27.8  (V, ~65-70% SOC, range: 22.0-32.0)
+ChargeProfiles/WinterRest/AbsorptionTime      = 2700  (seconds, range: 0-86400)
+ChargeProfiles/WinterRest/FloatExitTime       = 5400  (seconds, range: 0-86400)
+
+ChargeProfiles/SpringRest/AbsorptionVoltage   = 27.6  (V, ~60-65% SOC, range: 22.0-32.0)
+ChargeProfiles/SpringRest/FloatVoltage        = 27.4  (V, ~55-60% SOC, range: 22.0-32.0)
+ChargeProfiles/SpringRest/AbsorptionTime      = 1200  (seconds, range: 0-86400)
+ChargeProfiles/SpringRest/FloatExitTime       = 7200  (seconds, range: 0-86400)
+```
+
+**Visit profiles** (manually activated, never auto-switched away from):
+```
+ChargeProfiles/MaybeVisit/AbsorptionVoltage   = 28.1  (V, ~78-82% SOC, range: 22.0-32.0)
+ChargeProfiles/MaybeVisit/FloatVoltage        = 27.8  (V, ~65-70% SOC, range: 22.0-32.0)
+ChargeProfiles/MaybeVisit/AbsorptionTime      = 2700  (seconds, range: 0-86400)
+ChargeProfiles/MaybeVisit/FloatExitTime       = 3600  (seconds, range: 0-86400)
+
+ChargeProfiles/PlannedVisit/AbsorptionVoltage = 28.4  (V, ~88-92% SOC, range: 22.0-32.0)
+ChargeProfiles/PlannedVisit/FloatVoltage      = 27.8  (V, ~65-70% SOC, range: 22.0-32.0)
+ChargeProfiles/PlannedVisit/AbsorptionTime    = 3600  (seconds, range: 0-86400)
+ChargeProfiles/PlannedVisit/FloatExitTime     = 1800  (seconds, range: 0-86400)
+
+ChargeProfiles/AtCabin/AbsorptionVoltage      = 28.36 (V, ~85-90% SOC, range: 22.0-32.0)
+ChargeProfiles/AtCabin/FloatVoltage           = 28.0  (V, ~75-80% SOC, range: 22.0-32.0)
+ChargeProfiles/AtCabin/AbsorptionTime         = 5400  (seconds, range: 0-86400)
+ChargeProfiles/AtCabin/FloatExitTime          =  900  (seconds, range: 0-86400)
+```
+
+**Season start dates** (MM-DD format, configurable):
+```
+Season/SpringStart  = "03-01"   (1st March)
+Season/SummerStart  = "06-01"   (1st June)
+Season/AutumnStart  = "09-01"   (1st September)
+Season/WinterStart  = "12-01"   (1st December)
 ```
 
 **Note:** All voltage values are actual system voltages. Driver automatically converts to 12V-equivalent when writing to EEPROM (12V/24V/48V systems supported).
 
-**Example:** Configure custom winter profile
+**FloatExitTime** (Et_float_exit_cum, register 0xE006) = cumulative time the battery voltage must remain below float voltage before the controller exits float stage. Longer = stays in float longer.
+
+**Example:** Adjust a profile parameter
 ```bash
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage SetValue 29.0
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage SetValue 27.8
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime SetValue 10800
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage SetValue 26.6
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/AbsorptionVoltage SetValue 28.4
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatExitTime SetValue 9000
+```
+
+**Example:** Change autumn start date to October 1st
+```bash
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/Season/AutumnStart SetValue "10-01"
 ```
 
 **Example:** Change tail current threshold
@@ -198,9 +238,14 @@ Located at: `venus-home/N/.../solarcharger/0/Control/...`
 #### Charge Profile Management
 ```
 /Control/ApplyChargeProfile     WRITEABLE (text)
-  "summer"  = Apply summer profile (lower voltage, shorter absorption)
-  "winter"  = Apply winter profile (higher voltage, longer absorption)
-  "custom"  = Apply custom profile (user-configurable via Settings)
+  "rest"         = Auto-select current season's rest profile (recommended)
+  "summerrest"   = Apply SummerRest profile
+  "autumnrest"   = Apply AutumnRest profile
+  "winterrest"   = Apply WinterRest profile
+  "springrest"   = Apply SpringRest profile
+  "maybevisit"   = Apply MaybeVisit profile
+  "plannedvisit" = Apply PlannedVisit profile
+  "atcabin"      = Apply AtCabin profile
 
   Effect: Writes charge parameters to EEPROM with safety checks
   Safety: DISCONNECT → Write → Verify → Reset controller
@@ -255,7 +300,7 @@ Located at: `venus-home/N/.../solarcharger/0/Custom/...`
 /Custom/EEPROM/AbsorptionVoltage            (V) - Active absorption voltage (0xE000)
 /Custom/EEPROM/FloatVoltage                 (V) - Active float voltage (0xE001)
 /Custom/EEPROM/AbsorptionTime               (sec) - Active absorption time (0xE002)
-/Custom/EEPROM/FloatCancelVoltage           (V) - Active float cancel voltage (0xE005)
+/Custom/EEPROM/FloatExitTime                (sec) - Cumulative float exit timer (0xE006)
 /Custom/EEPROM/EqualizeVoltage              (V) - Configured equalize voltage
 /Custom/EEPROM/TempCompensation             (V/C) - Temperature compensation
 /Custom/EEPROM/MaxRegulationLimit           (V) - Max regulation voltage limit
@@ -270,6 +315,12 @@ Located at: `venus-home/N/.../solarcharger/0/Custom/...`
 /Custom/ChargeProfile/ProgressPercent       (%) - Apply operation progress (0-100)
 /Custom/ChargeProfile/LastError             (text) - Last error message (if failed)
 /Custom/ChargeProfile/LastApplied           (text) - "profile_name at YYYY-MM-DD HH:MM:SS"
+```
+
+#### Seasonal Profile Status
+```
+/Custom/Season/CurrentSeason                (text) - Current season: "summer"|"autumn"|"winter"|"spring"
+/Custom/Season/ActiveProfile                (text) - Last successfully applied profile name
 ```
 
 #### Battery & Internal Monitoring
@@ -505,40 +556,56 @@ Less tested than voltage-only override. Testing showed voltage override alone is
 ## Charge Profile Management System
 
 ### Purpose
-Switch between seasonal battery charging profiles (summer/winter/custom) by safely programming EEPROM charge parameters. Optimizes battery life and capacity based on temperature and usage patterns.
+Switch between seasonal battery charging profiles by safely programming EEPROM charge parameters. Optimizes NMC/NCA 7S lithium-ion battery life based on season and cabin usage patterns.
 
-### Use Cases
-- **Summer:** Lower voltage (28.4V), shorter absorption (2h) - prevents overcharging in warm weather
-- **Winter:** Higher voltage (28.8V), longer absorption (2.5h) - ensures full charge in cold weather
-- **Custom:** User-defined profile for specific battery type or location
+### Profile Categories
+
+**Rest profiles** (cabin unoccupied — maintenance charging):
+- `summerrest` — Gentle maintenance, lowest voltages
+- `autumnrest` — Moderate maintenance
+- `winterrest` — Higher voltage to overcome cold temperatures
+- `springrest` — Same as autumnrest
+
+**Visit profiles** (manual activation only — never auto-switched away from):
+- `maybevisit` — Possibly arriving soon
+- `plannedvisit` — Trip confirmed, charge up in advance
+- `atcabin` — Currently at the cabin
+
+### Seasonal Auto-Switch
+At 02:30 local time the driver checks whether the season has changed. If yes **and** the active profile is a rest profile, the new season's rest profile is applied automatically. If a visit profile is active, the switch is skipped (logged) and will apply on the next manual `rest` command.
+
+Season boundaries are configurable (default: Spring=Mar 1, Summer=Jun 1, Autumn=Sep 1, Winter=Dec 1).
 
 ### Parameters Programmed
 Each profile sets four EEPROM charge parameters:
-- **AbsorptionVoltage** (EV_absorp) - Target voltage for absorption stage
-- **FloatVoltage** (EV_float) - Voltage for float/maintenance stage
-- **AbsorptionTime** (Et_absorp) - Duration of absorption stage
-- **FloatCancelVoltage** (EV_float_cancel) - Voltage below which float is cancelled
+- **AbsorptionVoltage** (EV_absorp, 0xE000) - Target voltage for absorption stage
+- **FloatVoltage** (EV_float, 0xE001) - Voltage for float/maintenance stage
+- **AbsorptionTime** (Et_absorp, 0xE002) - Max duration of absorption stage (seconds)
+- **FloatExitTime** (Et_float_exit_cum, 0xE006) - Cumulative time below float voltage before exiting float (seconds)
 
 ### How It Works
 
 #### 1. Configure Profile (Optional)
 ```bash
-# Customize the custom profile via D-Bus Settings
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage SetValue 28.8
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage SetValue 27.6
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime SetValue 9000
-dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage SetValue 26.4
+# Adjust a profile parameter via D-Bus Settings
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/AbsorptionVoltage SetValue 28.4
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatVoltage SetValue 27.6
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/AbsorptionTime SetValue 9000
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatExitTime SetValue 9000
 ```
 
-Summer and winter profiles have fixed defaults and cannot be customized via D-Bus.
+All seven profiles are fully customizable via D-Bus Settings.
 
 #### 2. Apply Profile
 ```bash
-# Via D-Bus
-dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "winter"
+# Auto-select rest profile for current season (recommended)
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "rest"
+
+# Apply specific profile
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "plannedvisit"
 
 # Via MQTT (Home Assistant)
-mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile" -m '{"value": "winter"}'
+mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile" -m '{"value": "rest"}'
 ```
 
 #### 3. Driver Executes Safe EEPROM Write Procedure
@@ -560,8 +627,8 @@ Following Morningstar's recommended procedure:
 - Ensures controller is not actively regulating
 
 **Step 4: Write EEPROM**
-- Write parameters in safe order (lowest voltage first):
-  1. FloatCancelVoltage (EV_float_cancel, register 0xE005)
+- Write parameters in safe order:
+  1. FloatExitTime (Et_float_exit_cum, register 0xE006) — integer seconds
   2. FloatVoltage (EV_float, register 0xE001)
   3. AbsorptionVoltage (EV_absorp, register 0xE000)
   4. AbsorptionTime (Et_absorp, register 0xE002)
@@ -571,7 +638,7 @@ Following Morningstar's recommended procedure:
 **Step 5: Verify**
 - Read back all written parameters
 - Convert from 12V-equivalent to actual voltage
-- Tolerance: ±0.1V for voltages, exact match for time
+- Tolerance: ±0.01V for voltages, exact match for time
 - Raises exception if verification fails
 
 **Step 6: Reset Controller**
@@ -632,7 +699,16 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/LastAppli
 dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/AbsorptionVoltage GetValue
 dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/FloatVoltage GetValue
 dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/AbsorptionTime GetValue
-dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/FloatCancelVoltage GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/EEPROM/FloatExitTime GetValue
+```
+
+#### Season & Active Profile
+```bash
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Season/CurrentSeason GetValue
+# Returns: "summer", "autumn", "winter", or "spring"
+
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Season/ActiveProfile GetValue
+# Returns last applied profile name, e.g. "autumnrest"
 ```
 
 These values update automatically after successful profile apply.
@@ -641,11 +717,12 @@ These values update automatically after successful profile apply.
 1. **Parameter validation** - Ensures float < absorption, values in safe ranges
 2. **DISCONNECT before writes** - Controller not actively regulating
 3. **Backups** - Automatic timestamped backup before changes
-4. **Verification** - Read-after-write with tolerance checking
+4. **Verification** - Read-after-write with ±0.01V tolerance
 5. **Thread safety** - Main loop paused, no Modbus collisions
-6. **Voltage limits** - Enforced in Settings (26.0-32.0V absorption, 24.0-30.0V float)
+6. **Voltage limits** - Enforced in Settings (22.0-32.0V for all voltage params)
 7. **Smart retry** - Control path resets to '' after each operation, allows immediate retry
 8. **Status tracking** - ApplyStatus prevents concurrent operations
+9. **Visit profile protection** - Seasonal auto-switch never overrides a visit profile
 
 ### Typical Operation Time
 - **No changes:** < 1 second (validation only)
@@ -667,34 +744,24 @@ If operation fails:
 
 ### Home Assistant Integration Example
 ```yaml
-# Seasonal automation
+# Apply visit profile when planning a trip
 automation:
-  - alias: "Apply Winter Charge Profile"
-    trigger:
-      - platform: time
-        at: "00:00:00"
-    condition:
-      - condition: template
-        value_template: "{{ now().month in [11, 12, 1, 2, 3] }}"  # Nov-Mar
+  - alias: "Planned cabin visit - charge up"
     action:
       - service: mqtt.publish
         data:
           topic: "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile"
-          payload: '{"value": "winter"}'
+          payload: '{"value": "plannedvisit"}'
 
-  - alias: "Apply Summer Charge Profile"
-    trigger:
-      - platform: time
-        at: "00:00:00"
-    condition:
-      - condition: template
-        value_template: "{{ now().month in [4, 5, 6, 7, 8, 9, 10] }}"  # Apr-Oct
+  - alias: "Back from cabin - return to seasonal rest"
     action:
       - service: mqtt.publish
         data:
           topic: "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile"
-          payload: '{"value": "summer"}'
+          payload: '{"value": "rest"}'
 ```
+
+**Note:** Seasonal switching (rest profiles) is handled automatically by the driver at 02:30 local time. No Home Assistant automation needed for seasonal switching.
 
 ---
 

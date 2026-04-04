@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.34"  # Fix: Add time offsets for absorption/float/equalize across controller resets
+VERSION = "2.35"  # Feat: 7 charge profiles (4 seasonal rest + 3 visit), seasonal auto-switch at 02:30
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -128,10 +128,23 @@ COIL_RESET_CTRL = 255      # Reset controller (momentary, only when dark!)
 COIL_RESET_COMM = 4351     # Reset comm server (momentary)
 
 # EEPROM registers (read/write) - Charge settings
-REG_EEPROM_EV_ABSORP = 0xE000        # Absorption voltage
-REG_EEPROM_EV_FLOAT = 0xE001         # Float voltage
-REG_EEPROM_ET_ABSORP = 0xE002        # Absorption time (seconds)
-REG_EEPROM_EV_FLOAT_CANCEL = 0xE005  # Float cancel voltage
+REG_EEPROM_EV_ABSORP = 0xE000            # Absorption voltage
+REG_EEPROM_EV_FLOAT = 0xE001             # Float voltage
+REG_EEPROM_ET_ABSORP = 0xE002            # Absorption time (seconds)
+REG_EEPROM_EV_FLOAT_CANCEL = 0xE005     # Float cancel voltage (legacy, not used in profiles)
+REG_EEPROM_ET_FLOAT_EXIT_CUM = 0xE006   # Float exit timer (cumulative seconds below float voltage)
+
+# Charge profile sets
+REST_PROFILES = {'summerrest', 'autumnrest', 'winterrest', 'springrest'}
+VISIT_PROFILES = {'maybevisit', 'plannedvisit', 'atcabin'}
+ALL_PROFILES = REST_PROFILES | VISIT_PROFILES
+
+SEASON_TO_REST_PROFILE = {
+    'summer': 'summerrest',
+    'autumn': 'autumnrest',
+    'winter': 'winterrest',
+    'spring': 'springrest',
+}
 
 # Charge states
 CS_NIGHT = 3
@@ -220,24 +233,47 @@ class TriStarDriver:
                 'max_voltage_override_time': ['/Settings/TristarMPPT/MaxVoltageOverrideTime', CONFIG['max_voltage_override_time'], 0, 86400],
                 'battery_full_current': ['/Settings/TristarMPPT/BatteryFullCurrent', CONFIG['battery_full_current'], 0.0, 100.0],
                 'tail_current_time': ['/Settings/TristarMPPT/TailCurrentTime', CONFIG['tail_current_time'], 0, 3600],
-                # Charge profile settings (Summer)
-                'profile_summer_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionVoltage', 28.4, 26.0, 32.0],
-                'profile_summer_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatVoltage', 27.2, 24.0, 30.0],
-                'profile_summer_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Summer/AbsorptionTime', 7200, 0, 86400],
-                'profile_summer_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Summer/FloatCancelVoltage', 26.0, 0.0, 32.0],
-                # Charge profile settings (Winter)
-                'profile_winter_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionVoltage', 28.8, 26.0, 32.0],
-                'profile_winter_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatVoltage', 27.6, 24.0, 30.0],
-                'profile_winter_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Winter/AbsorptionTime', 9000, 0, 86400],
-                'profile_winter_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Winter/FloatCancelVoltage', 26.4, 0.0, 32.0],
-                # Charge profile settings (Custom)
-                'profile_custom_absorption_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage', 28.6, 26.0, 32.0],
-                'profile_custom_float_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatVoltage', 27.4, 24.0, 30.0],
-                'profile_custom_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime', 8400, 0, 86400],
-                'profile_custom_float_cancel_v': ['/Settings/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage', 26.2, 0.0, 32.0],
+                # Charge profile settings - Rest profiles (seasonal, auto-switched)
+                'profile_summerrest_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SummerRest/AbsorptionVoltage', 27.4, 24.0, 32.0],
+                'profile_summerrest_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SummerRest/FloatVoltage', 27.2, 22.0, 30.0],
+                'profile_summerrest_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerRest/AbsorptionTime', 900, 0, 86400],
+                'profile_summerrest_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerRest/FloatExitTime', 7200, 0, 86400],
+                'profile_autumnrest_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/AutumnRest/AbsorptionVoltage', 27.8, 24.0, 32.0],
+                'profile_autumnrest_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/AutumnRest/FloatVoltage', 27.6, 22.0, 30.0],
+                'profile_autumnrest_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnRest/AbsorptionTime', 1800, 0, 86400],
+                'profile_autumnrest_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnRest/FloatExitTime', 5400, 0, 86400],
+                'profile_winterrest_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/WinterRest/AbsorptionVoltage', 28.0, 24.0, 32.0],
+                'profile_winterrest_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatVoltage', 27.8, 22.0, 30.0],
+                'profile_winterrest_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterRest/AbsorptionTime', 2700, 0, 86400],
+                'profile_winterrest_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatExitTime', 5400, 0, 86400],
+                'profile_springrest_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/AbsorptionVoltage', 27.6, 24.0, 32.0],
+                'profile_springrest_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/FloatVoltage', 27.4, 22.0, 30.0],
+                'profile_springrest_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/AbsorptionTime', 1200, 0, 86400],
+                'profile_springrest_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/FloatExitTime', 7200, 0, 86400],
+                # Charge profile settings - Visit profiles (manual, all seasons)
+                'profile_maybevisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/AbsorptionVoltage', 28.1, 24.0, 32.0],
+                'profile_maybevisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/FloatVoltage', 27.8, 22.0, 30.0],
+                'profile_maybevisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/AbsorptionTime', 2700, 0, 86400],
+                'profile_maybevisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/FloatExitTime', 3600, 0, 86400],
+                'profile_plannedvisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/AbsorptionVoltage', 28.4, 24.0, 32.0],
+                'profile_plannedvisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/FloatVoltage', 27.8, 22.0, 30.0],
+                'profile_plannedvisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/AbsorptionTime', 3600, 0, 86400],
+                'profile_plannedvisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/FloatExitTime', 1800, 0, 86400],
+                'profile_atcabin_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/AbsorptionVoltage', 28.36, 24.0, 32.0],
+                'profile_atcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/FloatVoltage', 28.0, 22.0, 30.0],
+                'profile_atcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/AbsorptionTime', 5400, 0, 86400],
+                'profile_atcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/FloatExitTime', 900, 0, 86400],
+                # Season switch dates (format: "MM-DD")
+                'season_spring_start': ['/Settings/TristarMPPT/Season/SpringStart', '03-01', 0, 0],
+                'season_summer_start': ['/Settings/TristarMPPT/Season/SummerStart', '06-01', 0, 0],
+                'season_autumn_start': ['/Settings/TristarMPPT/Season/AutumnStart', '09-01', 0, 0],
+                'season_winter_start': ['/Settings/TristarMPPT/Season/WinterStart', '12-01', 0, 0],
             },
             eventCallback=self._setting_changed
         )
+
+        # Remove legacy settings from old 3-profile system (v1 → v2 migration)
+        self._remove_legacy_settings()
 
         # Device state
         self.initialized = False
@@ -334,6 +370,7 @@ class TriStarDriver:
 
         # Nightly reset tracking
         self.last_reset_date = self.state.get('current_date')
+        self.season_check_done_today = False  # Reset daily at midnight
 
         # Daily register reset detection (for post-midnight, pre-sunrise handling)
         # Load from state (persists across restarts to know if Modbus is valid)
@@ -449,7 +486,9 @@ class TriStarDriver:
                 "time_used_today": 0,         # Seconds at override voltage today
                 "current_date": self._get_local_date(),  # Date for midnight reset
                 "stop_reason": ""             # Last stop reason
-            }
+            },
+            "active_profile": "",       # Last successfully applied charge profile
+            "last_known_season": ""     # Season at last profile auto-switch check
         }
 
     def _save_state(self):
@@ -636,6 +675,9 @@ class TriStarDriver:
                 self.state['daily_wh_offset'] = 0.0
                 logging.info("Daily Wh offset reset for new day")
 
+                # Reset season check flag for new day
+                self.season_check_done_today = False
+
                 # Reset daily time offsets for new day
                 self.time_abs_offset = 0
                 self.time_float_offset = 0
@@ -773,7 +815,7 @@ class TriStarDriver:
         s.add_path('/Custom/EEPROM/AbsorptionVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/EEPROM/FloatVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/EEPROM/AbsorptionTime', 0, writeable=False, gettextcallback=lambda p, v: f"{v}s")
-        s.add_path('/Custom/EEPROM/FloatCancelVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
+        s.add_path('/Custom/EEPROM/FloatExitTime', 0, writeable=False, gettextcallback=lambda p, v: f"{v}s")
         s.add_path('/Custom/EEPROM/EqualizeVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/EEPROM/TempCompensation', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V/C")
         s.add_path('/Custom/EEPROM/MaxRegulationLimit', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
@@ -784,6 +826,10 @@ class TriStarDriver:
         s.add_path('/Custom/ChargeProfile/LastApplied', '', writeable=False)
         s.add_path('/Custom/ChargeProfile/LastError', '', writeable=False)
         s.add_path('/Custom/ChargeProfile/ProgressPercent', 0, writeable=False)
+
+        # Season tracking (read-only display)
+        s.add_path('/Custom/Season/CurrentSeason', '', writeable=False)
+        s.add_path('/Custom/Season/ActiveProfile', '', writeable=False)
 
         # EEPROM lifetime charge counters (TriStar's internal counters)
         s.add_path('/Custom/EEPROM/ChargeKwhResetable', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}kWh")
@@ -2290,6 +2336,22 @@ class TriStarDriver:
 
         reset_hour = self.settings['nightly_reset_hour']
 
+        # Seasonal auto-switch check at 02:30 (before nightly reset at 03:00)
+        if current_hour == 2 and current_minute == 30:
+            if not self.season_check_done_today:
+                self.season_check_done_today = True
+                new_season = self._get_current_season()
+                last_season = self.state.get('last_known_season', '')
+                if new_season != last_season:
+                    self.state['last_known_season'] = new_season
+                    active = self.state.get('active_profile', '')
+                    if active in REST_PROFILES:
+                        logging.info(f"Season changed {last_season!r} → {new_season!r}, auto-applying {SEASON_TO_REST_PROFILE[new_season]}")
+                        self._apply_rest_profile_for_season(new_season)
+                    else:
+                        logging.info(f"Season changed {last_season!r} → {new_season!r}, but active='{active}' is a visit profile — skipping auto-switch")
+                    self._save_state()
+
         # Check if it's reset time (5-minute window to catch it)
         if current_hour == reset_hour and current_minute < 5:
             # Only attempt reset once per day
@@ -2330,28 +2392,17 @@ class TriStarDriver:
         profile_file = Path("/data/dbus-tristar/charge_profiles.json")
 
         default_profiles = {
-            "version": 1,
+            "version": 2,
             "last_applied_profile": "",
             "last_applied_timestamp": "",
             "profiles": {
-                "summer": {
-                    "EV_absorp": 28.4,
-                    "EV_float": 27.2,
-                    "Et_absorp": 7200,
-                    "EV_float_cancel": 26.0
-                },
-                "winter": {
-                    "EV_absorp": 28.8,
-                    "EV_float": 27.6,
-                    "Et_absorp": 9000,
-                    "EV_float_cancel": 26.4
-                },
-                "custom": {
-                    "EV_absorp": 28.6,
-                    "EV_float": 27.4,
-                    "Et_absorp": 8400,
-                    "EV_float_cancel": 26.2
-                }
+                "summerrest":   {"EV_absorp": 27.4,  "EV_float": 27.2, "Et_absorp":  900, "Et_float_exit_cum": 7200},
+                "autumnrest":   {"EV_absorp": 27.8,  "EV_float": 27.6, "Et_absorp": 1800, "Et_float_exit_cum": 5400},
+                "winterrest":   {"EV_absorp": 28.0,  "EV_float": 27.8, "Et_absorp": 2700, "Et_float_exit_cum": 5400},
+                "springrest":   {"EV_absorp": 27.6,  "EV_float": 27.4, "Et_absorp": 1200, "Et_float_exit_cum": 7200},
+                "maybevisit":   {"EV_absorp": 28.1,  "EV_float": 27.8, "Et_absorp": 2700, "Et_float_exit_cum": 3600},
+                "plannedvisit": {"EV_absorp": 28.4,  "EV_float": 27.8, "Et_absorp": 3600, "Et_float_exit_cum": 1800},
+                "atcabin":      {"EV_absorp": 28.36, "EV_float": 28.0, "Et_absorp": 5400, "Et_float_exit_cum":  900},
             }
         }
 
@@ -2359,11 +2410,30 @@ class TriStarDriver:
             if profile_file.exists():
                 with open(profile_file, 'r') as f:
                     profiles = json.load(f)
-                    # Merge with defaults for any missing profiles
-                    for profile_name in default_profiles["profiles"]:
-                        if profile_name not in profiles.get("profiles", {}):
-                            profiles["profiles"][profile_name] = default_profiles["profiles"][profile_name]
+
+                # Migrate old 3-profile format (version 1: summer/winter/custom with EV_float_cancel)
+                existing_names = set(profiles.get("profiles", {}).keys())
+                old_names = {'summer', 'winter', 'custom'}
+                if existing_names <= old_names:
+                    logging.info("Migrating charge_profiles.json from v1 (3 profiles) to v2 (7 profiles)")
+                    profiles["version"] = 2
+                    profiles["profiles"] = default_profiles["profiles"].copy()
+                    profiles["last_applied_profile"] = ""
+                    profiles["last_applied_timestamp"] = ""
+                    # Save migrated file
+                    try:
+                        with open(profile_file, 'w') as f:
+                            json.dump(profiles, f, indent=2)
+                        logging.info("Migrated charge_profiles.json saved")
+                    except Exception as save_err:
+                        logging.error(f"Failed to save migrated profiles: {save_err}")
                     return profiles
+
+                # Merge defaults for any missing profiles
+                for profile_name, profile_data in default_profiles["profiles"].items():
+                    if profile_name not in profiles.get("profiles", {}):
+                        profiles["profiles"][profile_name] = profile_data
+                return profiles
         except Exception as e:
             logging.error(f"Failed to load charge profiles: {e}")
 
@@ -2377,6 +2447,43 @@ class TriStarDriver:
             logging.error(f"Failed to create default charge profiles file: {e}")
 
         return default_profiles
+
+    def _remove_legacy_settings(self):
+        """Remove old Summer/Winter/Custom charge profile settings left over from v1"""
+        # Paths use the localsettings internal format (without /Settings prefix)
+        legacy_paths = [
+            '/TristarMPPT/ChargeProfiles/Summer/AbsorptionVoltage',
+            '/TristarMPPT/ChargeProfiles/Summer/FloatVoltage',
+            '/TristarMPPT/ChargeProfiles/Summer/AbsorptionTime',
+            '/TristarMPPT/ChargeProfiles/Summer/FloatCancelVoltage',
+            '/TristarMPPT/ChargeProfiles/Winter/AbsorptionVoltage',
+            '/TristarMPPT/ChargeProfiles/Winter/FloatVoltage',
+            '/TristarMPPT/ChargeProfiles/Winter/AbsorptionTime',
+            '/TristarMPPT/ChargeProfiles/Winter/FloatCancelVoltage',
+            '/TristarMPPT/ChargeProfiles/Custom/AbsorptionVoltage',
+            '/TristarMPPT/ChargeProfiles/Custom/FloatVoltage',
+            '/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime',
+            '/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage',
+        ]
+        try:
+            bus = dbus.SystemBus()
+            # Check if any legacy paths still exist before attempting removal
+            existing = []
+            for path in legacy_paths:
+                try:
+                    obj = bus.get_object('com.victronenergy.settings', '/Settings' + path)
+                    obj.GetValue()
+                    existing.append(path)
+                except Exception:
+                    pass
+            if not existing:
+                return
+            settings_obj = bus.get_object('com.victronenergy.settings', '/Settings')
+            remove_settings = settings_obj.get_dbus_method('RemoveSettings', 'com.victronenergy.Settings')
+            remove_settings(dbus.Array(existing, signature='s'))
+            logging.info(f"Removed {len(existing)} legacy charge profile settings (v1 → v2 migration)")
+        except Exception as e:
+            logging.debug(f"Legacy settings cleanup skipped: {e}")
 
     def _save_charge_profiles(self):
         """Save charge profiles to JSON file (atomic write)"""
@@ -2402,8 +2509,14 @@ class TriStarDriver:
             logging.error(f"Empty profile name after parsing")
             return False
 
-        if profile_name not in ['summer', 'winter', 'custom']:
-            error_msg = f"Invalid profile: {profile_name}. Must be 'summer', 'winter', or 'custom'"
+        # 'rest' is a special alias: auto-select seasonal rest profile
+        if profile_name == 'rest':
+            profile_name = SEASON_TO_REST_PROFILE[self._get_current_season()]
+            logging.info(f"'rest' resolved to '{profile_name}' for current season")
+
+        if profile_name not in ALL_PROFILES:
+            valid = sorted(ALL_PROFILES) + ['rest']
+            error_msg = f"Invalid profile: '{profile_name}'. Valid: {valid}"
             self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
             logging.error(error_msg)
             return False
@@ -2556,7 +2669,7 @@ class TriStarDriver:
 
             # Step 7: Write EEPROM parameters (in safe order: lowest voltage first)
             self._update_profile_status("writing", 40, "Writing EEPROM parameters...")
-            write_order = ['EV_float_cancel', 'EV_float', 'EV_absorp', 'Et_absorp']
+            write_order = ['Et_float_exit_cum', 'EV_float', 'EV_absorp', 'Et_absorp']
 
             written_count = 0
             for param in write_order:
@@ -2629,6 +2742,11 @@ class TriStarDriver:
             # Flag main loop to refresh EEPROM charge settings on next update
             self.eeprom_refresh_needed = True
 
+            # Track active profile and update season display
+            self.state['active_profile'] = profile_name
+            self.dbus['/Custom/Season/ActiveProfile'] = profile_name
+            self._save_state()
+
             logging.info(f"✅ Charge profile '{profile_name}' applied successfully ({len(changes)} changes)")
 
         except Exception as e:
@@ -2681,14 +2799,12 @@ class TriStarDriver:
 
     def _get_profile_from_settings(self, profile_name):
         """Read profile values from D-Bus Settings"""
-        profile_cap = profile_name.capitalize()
-
         # Read from SettingsDevice (values are already loaded in self.settings)
         key_map = {
             'EV_absorp': f'profile_{profile_name}_absorption_v',
             'EV_float': f'profile_{profile_name}_float_v',
             'Et_absorp': f'profile_{profile_name}_absorption_time',
-            'EV_float_cancel': f'profile_{profile_name}_float_cancel_v',
+            'Et_float_exit_cum': f'profile_{profile_name}_float_exit_time',
         }
 
         profile = {}
@@ -2696,8 +2812,8 @@ class TriStarDriver:
             try:
                 value = self.settings[setting_key]
             except KeyError:
-                raise Exception(f"Setting '{setting_key}' not found")
-            profile[param] = int(value) if param == 'Et_absorp' else float(value)
+                raise Exception(f"Setting '{setting_key}' not found for profile '{profile_name}'")
+            profile[param] = int(value) if param in ('Et_absorp', 'Et_float_exit_cum') else float(value)
 
         return profile
 
@@ -2705,22 +2821,20 @@ class TriStarDriver:
         """Validate profile parameter relationships"""
         ev_float = profile['EV_float']
         ev_absorp = profile['EV_absorp']
-        ev_float_cancel = profile['EV_float_cancel']
         et_absorp = profile['Et_absorp']
+        et_float_exit_cum = profile['Et_float_exit_cum']
 
         if ev_float >= ev_absorp:
             raise Exception(f"Float voltage ({ev_float}V) must be < Absorption voltage ({ev_absorp}V)")
 
-        # Allow 0 for float_cancel (disables the function)
-        if ev_float_cancel > 0 and ev_float_cancel >= ev_float:
-            raise Exception(f"Float cancel voltage ({ev_float_cancel}V) must be < Float voltage ({ev_float}V)")
+        if not (24.0 <= ev_absorp <= 32.0):
+            raise Exception(f"Absorption voltage {ev_absorp}V out of safe range (24-32V)")
 
-        if not (26.0 <= ev_absorp <= 32.0):
-            raise Exception(f"Absorption voltage {ev_absorp}V out of safe range (26-32V)")
-
-        # Allow any absorption time from 0 (disabled) to 24 hours
         if not (0 <= et_absorp <= 86400):
-            raise Exception(f"Absorption time {et_absorp}s out of range (0-86400s / 0-24 hours)")
+            raise Exception(f"Absorption time {et_absorp}s out of range (0-86400s)")
+
+        if not (0 <= et_float_exit_cum <= 86400):
+            raise Exception(f"Float exit time {et_float_exit_cum}s out of range (0-86400s)")
 
     def _read_eeprom_values(self):
         """
@@ -2731,13 +2845,13 @@ class TriStarDriver:
             'EV_absorp': REG_EEPROM_EV_ABSORP,
             'EV_float': REG_EEPROM_EV_FLOAT,
             'Et_absorp': REG_EEPROM_ET_ABSORP,
-            'EV_float_cancel': REG_EEPROM_EV_FLOAT_CANCEL,
+            'Et_float_exit_cum': REG_EEPROM_ET_FLOAT_EXIT_CUM,
         }
 
         values = {}
         for param, addr in reg_map.items():
             raw = self.client.read_holding_registers(addr, 1, unit=self.settings['slave_id']).registers[0]
-            if param == 'Et_absorp':
+            if param in ('Et_absorp', 'Et_float_exit_cum'):
                 values[param] = raw  # Seconds, no scaling
             else:
                 # EEPROM stores 12V-equivalent, convert to actual voltage
@@ -2751,10 +2865,12 @@ class TriStarDriver:
         changes = {}
         tolerance = 0.01  # ±0.01V tolerance for voltage comparisons
 
+        integer_params = ('Et_absorp', 'Et_float_exit_cum')
+
         for param, new_value in new_profile.items():
             current_value = current_eeprom.get(param)
 
-            if param == 'Et_absorp':
+            if param in integer_params:
                 if current_value != new_value:
                     changes[param] = new_value
             else:
@@ -2772,12 +2888,12 @@ class TriStarDriver:
             'EV_absorp': REG_EEPROM_EV_ABSORP,
             'EV_float': REG_EEPROM_EV_FLOAT,
             'Et_absorp': REG_EEPROM_ET_ABSORP,
-            'EV_float_cancel': REG_EEPROM_EV_FLOAT_CANCEL,
+            'Et_float_exit_cum': REG_EEPROM_ET_FLOAT_EXIT_CUM,
         }
 
         addr = reg_map[param]
 
-        if param == 'Et_absorp':
+        if param in ('Et_absorp', 'Et_float_exit_cum'):
             raw_value = int(value)
         else:
             # Convert actual voltage to 12V-equivalent for EEPROM storage
@@ -2785,7 +2901,7 @@ class TriStarDriver:
             # Scale to raw register value (use round() not int() for proper rounding)
             raw_value = round(voltage_12v / (self.v_pu * (2**-15)))
 
-        logging.info(f"Writing {param} = {value} (12V-eq: {value / self.system_voltage_scale if param != 'Et_absorp' else 'N/A'}, raw: {raw_value}) to EEPROM register 0x{addr:04X}")
+        logging.info(f"Writing {param} = {value} (raw: {raw_value}) to EEPROM register 0x{addr:04X}")
         self.client.write_register(addr, raw_value, unit=self.settings['slave_id'])
 
     def _verify_eeprom_writes(self, changes):
@@ -2793,18 +2909,18 @@ class TriStarDriver:
         Verify written values match expected
         Converts from 12V-equivalent stored in EEPROM to actual voltage for comparison
         """
-        for param, expected_value in changes.items():
-            reg_map = {
-                'EV_absorp': REG_EEPROM_EV_ABSORP,
-                'EV_float': REG_EEPROM_EV_FLOAT,
-                'Et_absorp': REG_EEPROM_ET_ABSORP,
-                'EV_float_cancel': REG_EEPROM_EV_FLOAT_CANCEL,
-            }
+        reg_map = {
+            'EV_absorp': REG_EEPROM_EV_ABSORP,
+            'EV_float': REG_EEPROM_EV_FLOAT,
+            'Et_absorp': REG_EEPROM_ET_ABSORP,
+            'Et_float_exit_cum': REG_EEPROM_ET_FLOAT_EXIT_CUM,
+        }
 
+        for param, expected_value in changes.items():
             addr = reg_map[param]
             raw = self.client.read_holding_registers(addr, 1, unit=self.settings['slave_id']).registers[0]
 
-            if param == 'Et_absorp':
+            if param in ('Et_absorp', 'Et_float_exit_cum'):
                 actual_value = raw
                 if actual_value != expected_value:
                     raise Exception(f"Verification failed for {param}: expected {expected_value}, got {actual_value}")
@@ -2855,7 +2971,6 @@ class TriStarDriver:
             ev_absorp_12v = eeprom_regs[0] * self.v_pu / 32768.0  # 0xE000
             ev_float_12v = eeprom_regs[1] * self.v_pu / 32768.0   # 0xE001
             et_absorp = eeprom_regs[2]                            # 0xE002 (seconds, no scaling)
-            ev_float_cancel_12v = eeprom_regs[5] * self.v_pu / 32768.0  # 0xE005
             ev_eq_12v = eeprom_regs[7] * self.v_pu / 32768.0      # 0xE007
             ev_tempcomp = eeprom_regs[13] * self.v_pu / 32768.0  # 0xE00D (V/C, no system scale)
             evb_ref_lim_12v = eeprom_regs[16] * self.v_pu / 32768.0  # 0xE010
@@ -2863,14 +2978,13 @@ class TriStarDriver:
             # Convert to actual voltages for display (multiply by system voltage scale)
             ev_absorp = ev_absorp_12v * self.system_voltage_scale
             ev_float = ev_float_12v * self.system_voltage_scale
-            ev_float_cancel = ev_float_cancel_12v * self.system_voltage_scale
             ev_eq = ev_eq_12v * self.system_voltage_scale
             evb_ref_lim = evb_ref_lim_12v * self.system_voltage_scale
 
             self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = round(ev_absorp, 2)
             self.dbus['/Custom/EEPROM/FloatVoltage'] = round(ev_float, 2)
             self.dbus['/Custom/EEPROM/AbsorptionTime'] = et_absorp
-            self.dbus['/Custom/EEPROM/FloatCancelVoltage'] = round(ev_float_cancel, 2)
+            self.dbus['/Custom/EEPROM/FloatExitTime'] = eeprom_regs[6]  # 0xE006 - Et_float_exit_cum (seconds)
             self.dbus['/Custom/EEPROM/EqualizeVoltage'] = round(ev_eq, 2)
             self.dbus['/Custom/EEPROM/TempCompensation'] = round(ev_tempcomp, 4)
             self.dbus['/Custom/EEPROM/MaxRegulationLimit'] = round(evb_ref_lim, 2)
@@ -2903,7 +3017,60 @@ class TriStarDriver:
         self.dbus['/Custom/EEPROM/AbsorptionVoltage'] = eeprom_values.get('EV_absorp', 0.0)
         self.dbus['/Custom/EEPROM/FloatVoltage'] = eeprom_values.get('EV_float', 0.0)
         self.dbus['/Custom/EEPROM/AbsorptionTime'] = eeprom_values.get('Et_absorp', 0)
-        self.dbus['/Custom/EEPROM/FloatCancelVoltage'] = eeprom_values.get('EV_float_cancel', 0.0)
+        self.dbus['/Custom/EEPROM/FloatExitTime'] = eeprom_values.get('Et_float_exit_cum', 0)
+
+    def _get_current_season(self):
+        """
+        Returns the current season ('summer'|'autumn'|'winter'|'spring')
+        based on today's local date and configurable season start dates.
+        """
+        try:
+            local_now = self._get_local_datetime()
+            month_day = local_now.strftime('%m-%d')
+
+            spring_start = self.settings.get('season_spring_start', '03-01')
+            summer_start = self.settings.get('season_summer_start', '06-01')
+            autumn_start = self.settings.get('season_autumn_start', '09-01')
+            winter_start = self.settings.get('season_winter_start', '12-01')
+
+            # Compare as strings - works correctly since format is MM-DD
+            if month_day >= winter_start or month_day < spring_start:
+                return 'winter'
+            elif month_day >= autumn_start:
+                return 'autumn'
+            elif month_day >= summer_start:
+                return 'summer'
+            else:
+                return 'spring'
+        except Exception as e:
+            logging.error(f"Error determining season: {e}")
+            return 'summer'  # Safe fallback
+
+    def _get_local_datetime(self):
+        """Get current local datetime (reuses timezone logic from _get_local_date)"""
+        from datetime import datetime as _datetime
+        try:
+            bus = dbus.SystemBus()
+            settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
+            tz_string = settings.GetValue()
+            os.environ['TZ'] = tz_string
+            time_module.tzset()
+        except Exception:
+            pass
+        return _datetime.now()
+
+    def _apply_rest_profile_for_season(self, season=None):
+        """
+        Apply the rest profile for the given (or current) season.
+        Triggers the same async apply flow as a manual profile request.
+        """
+        if season is None:
+            season = self._get_current_season()
+        profile_name = SEASON_TO_REST_PROFILE.get(season, 'summerrest')
+        logging.info(f"Applying rest profile for season '{season}': {profile_name}")
+        threading.Thread(target=self._apply_charge_profile_async,
+                        args=(profile_name,),
+                        daemon=True).start()
 
     def _reconnect_modbus(self):
         """Re-establish Modbus connection after reset"""
