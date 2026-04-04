@@ -3028,10 +3028,10 @@ class TriStarDriver:
             local_now = self._get_local_datetime()
             month_day = local_now.strftime('%m-%d')
 
-            spring_start = self.settings.get('season_spring_start', '03-01')
-            summer_start = self.settings.get('season_summer_start', '06-01')
-            autumn_start = self.settings.get('season_autumn_start', '09-01')
-            winter_start = self.settings.get('season_winter_start', '12-01')
+            spring_start = self.settings['season_spring_start']
+            summer_start = self.settings['season_summer_start']
+            autumn_start = self.settings['season_autumn_start']
+            winter_start = self.settings['season_winter_start']
 
             # Compare as strings - works correctly since format is MM-DD
             if month_day >= winter_start or month_day < spring_start:
