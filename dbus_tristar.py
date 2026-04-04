@@ -424,6 +424,10 @@ class TriStarDriver:
         self._setup_dbus_paths()
         self.dbus.register()
 
+        # Populate season/profile display paths from state
+        self.dbus['/Custom/Season/CurrentSeason'] = self._get_current_season()
+        self.dbus['/Custom/Season/ActiveProfile'] = self.state.get('active_profile', '')
+
         # Start periodic updates
         self._start_timer()
 
