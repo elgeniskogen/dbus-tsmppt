@@ -121,7 +121,7 @@ NightlyResetHour        = 3                (Reset at this hour local time, range
 #### Voltage Override Settings
 ```
 MaxVoltageOverrideVoltage = 28.7           (SAFETY LIMIT - max voltage, range: 24.0-32.0V)
-MaxVoltageOverrideTime    = 7200           (Max time per day in seconds, range: 0-86400)
+MaxVoltageOverrideTime    = 7200           (Max cumulative seconds battery voltage has been ≥ target voltage before override stops with StopReason="TimeLimit". Counter pauses (not resets) when voltage dips below target. Range: 0-86400)
 BatteryFullCurrent        = 2.0            (Tail current threshold in A, range: 0.0-100.0)
 TailCurrentTime           = 300            (Sustained tail current time in seconds, range: 0-3600)
 ExcessPowerThreshold      = 100            (Minimum excess power in W, range: -1-5000, -1=disabled)
@@ -529,7 +529,7 @@ else:
 
 #### 5. Time Limit
 
-**Condition:** Override active for too long.
+**Condition:** `TimeAtTargetVoltage` (cumulative seconds at/above target — pauses during dips, never resets) reaches `MaxVoltageOverrideTime`.
 
 ```python
 if time_at_target >= max_voltage_override_time:
