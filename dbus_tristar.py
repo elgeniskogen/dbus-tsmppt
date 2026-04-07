@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.35"  # Feat: 7 charge profiles (4 seasonal rest + 3 visit), seasonal auto-switch at 02:30
+VERSION = "2.36"  # Feat: HA integration — 16 seasonal profiles, PlannedVisitSOC, balance tracking
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -136,8 +136,14 @@ REG_EEPROM_ET_FLOAT_EXIT_CUM = 0xE006   # Float exit timer (cumulative seconds b
 
 # Charge profile sets
 REST_PROFILES = {'summerrest', 'autumnrest', 'winterrest', 'springrest'}
-VISIT_PROFILES = {'maybevisit', 'plannedvisit', 'atcabin'}
-ALL_PROFILES = REST_PROFILES | VISIT_PROFILES
+
+_SEASONS = ('summer', 'autumn', 'winter', 'spring')
+_VISIT_BASES = ('maybevisit', 'plannedvisit', 'atcabin')
+SEASONAL_VISIT_PROFILES = {f'{s}{v}' for s in _SEASONS for v in _VISIT_BASES}
+ALL_PROFILES = REST_PROFILES | SEASONAL_VISIT_PROFILES
+
+# HA sends only these logical names; driver resolves to seasonal variant
+HA_VISIT_NAMES = frozenset(_VISIT_BASES)
 
 SEASON_TO_REST_PROFILE = {
     'summer': 'summerrest',
@@ -145,6 +151,21 @@ SEASON_TO_REST_PROFILE = {
     'winter': 'winterrest',
     'spring': 'springrest',
 }
+
+SEASON_TO_VISIT_PROFILE = {
+    (s, v): f'{s}{v}' for s in _SEASONS for v in _VISIT_BASES
+}
+
+# NMC 7S (24V system) OCV → SOC lookup table at 15°C
+# Source: supplier OCV table, same as soc_anchor_service.py
+NMC_7S_OCV_TABLE = [
+    (24.0,   0.0),
+    (26.1,  20.0),
+    (26.7,  40.0),
+    (27.4,  60.0),
+    (28.0,  80.0),
+    (28.7, 100.0),
+]
 
 # Charge states
 CS_NIGHT = 3
@@ -250,19 +271,58 @@ class TriStarDriver:
                 'profile_springrest_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/FloatVoltage', 27.4, 22.0, 30.0],
                 'profile_springrest_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/AbsorptionTime', 1200, 0, 86400],
                 'profile_springrest_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringRest/FloatExitTime', 7200, 0, 86400],
-                # Charge profile settings - Visit profiles (manual, all seasons)
-                'profile_maybevisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/AbsorptionVoltage', 28.1, 24.0, 32.0],
-                'profile_maybevisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/FloatVoltage', 27.8, 22.0, 30.0],
-                'profile_maybevisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/AbsorptionTime', 2700, 0, 86400],
-                'profile_maybevisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/MaybeVisit/FloatExitTime', 3600, 0, 86400],
-                'profile_plannedvisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/AbsorptionVoltage', 28.4, 24.0, 32.0],
-                'profile_plannedvisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/FloatVoltage', 27.8, 22.0, 30.0],
-                'profile_plannedvisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/AbsorptionTime', 3600, 0, 86400],
-                'profile_plannedvisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/PlannedVisit/FloatExitTime', 1800, 0, 86400],
-                'profile_atcabin_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/AbsorptionVoltage', 28.36, 24.0, 32.0],
-                'profile_atcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/FloatVoltage', 28.0, 22.0, 30.0],
-                'profile_atcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/AbsorptionTime', 5400, 0, 86400],
-                'profile_atcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/AtCabin/FloatExitTime', 900, 0, 86400],
+                # Charge profile settings - Visit profiles (seasonal, 4 seasons × 3 types)
+                # MaybeVisit
+                'profile_summermaybevisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SummerMaybeVisit/AbsorptionVoltage', 27.9, 22.0, 32.0],
+                'profile_summermaybevisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SummerMaybeVisit/FloatVoltage', 27.6, 22.0, 32.0],
+                'profile_summermaybevisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerMaybeVisit/AbsorptionTime', 2100, 0, 86400],
+                'profile_summermaybevisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerMaybeVisit/FloatExitTime', 3600, 0, 86400],
+                'profile_autumnmaybevisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/AutumnMaybeVisit/AbsorptionVoltage', 28.1, 22.0, 32.0],
+                'profile_autumnmaybevisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/AutumnMaybeVisit/FloatVoltage', 27.8, 22.0, 32.0],
+                'profile_autumnmaybevisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnMaybeVisit/AbsorptionTime', 2700, 0, 86400],
+                'profile_autumnmaybevisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnMaybeVisit/FloatExitTime', 3600, 0, 86400],
+                'profile_wintermaybevisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/WinterMaybeVisit/AbsorptionVoltage', 28.3, 22.0, 32.0],
+                'profile_wintermaybevisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/WinterMaybeVisit/FloatVoltage', 28.0, 22.0, 32.0],
+                'profile_wintermaybevisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterMaybeVisit/AbsorptionTime', 3600, 0, 86400],
+                'profile_wintermaybevisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterMaybeVisit/FloatExitTime', 3600, 0, 86400],
+                'profile_springmaybevisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SpringMaybeVisit/AbsorptionVoltage', 28.0, 22.0, 32.0],
+                'profile_springmaybevisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SpringMaybeVisit/FloatVoltage', 27.7, 22.0, 32.0],
+                'profile_springmaybevisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringMaybeVisit/AbsorptionTime', 2400, 0, 86400],
+                'profile_springmaybevisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringMaybeVisit/FloatExitTime', 3600, 0, 86400],
+                # PlannedVisit
+                'profile_summerplannedvisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SummerPlannedVisit/AbsorptionVoltage', 28.2, 22.0, 32.0],
+                'profile_summerplannedvisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SummerPlannedVisit/FloatVoltage', 27.6, 22.0, 32.0],
+                'profile_summerplannedvisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerPlannedVisit/AbsorptionTime', 2700, 0, 86400],
+                'profile_summerplannedvisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerPlannedVisit/FloatExitTime', 1800, 0, 86400],
+                'profile_autumnplannedvisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/AutumnPlannedVisit/AbsorptionVoltage', 28.4, 22.0, 32.0],
+                'profile_autumnplannedvisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/AutumnPlannedVisit/FloatVoltage', 27.8, 22.0, 32.0],
+                'profile_autumnplannedvisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnPlannedVisit/AbsorptionTime', 3600, 0, 86400],
+                'profile_autumnplannedvisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnPlannedVisit/FloatExitTime', 1800, 0, 86400],
+                'profile_winterplannedvisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/WinterPlannedVisit/AbsorptionVoltage', 28.6, 22.0, 32.0],
+                'profile_winterplannedvisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/WinterPlannedVisit/FloatVoltage', 28.0, 22.0, 32.0],
+                'profile_winterplannedvisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterPlannedVisit/AbsorptionTime', 4500, 0, 86400],
+                'profile_winterplannedvisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterPlannedVisit/FloatExitTime', 1800, 0, 86400],
+                'profile_springplannedvisit_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SpringPlannedVisit/AbsorptionVoltage', 28.3, 22.0, 32.0],
+                'profile_springplannedvisit_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SpringPlannedVisit/FloatVoltage', 27.7, 22.0, 32.0],
+                'profile_springplannedvisit_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringPlannedVisit/AbsorptionTime', 3000, 0, 86400],
+                'profile_springplannedvisit_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringPlannedVisit/FloatExitTime', 1800, 0, 86400],
+                # AtCabin
+                'profile_summeratcabin_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SummerAtCabin/AbsorptionVoltage', 28.2, 22.0, 32.0],
+                'profile_summeratcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SummerAtCabin/FloatVoltage', 27.8, 22.0, 32.0],
+                'profile_summeratcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerAtCabin/AbsorptionTime', 4500, 0, 86400],
+                'profile_summeratcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SummerAtCabin/FloatExitTime', 900, 0, 86400],
+                'profile_autumnatcabin_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/AutumnAtCabin/AbsorptionVoltage', 28.36, 22.0, 32.0],
+                'profile_autumnatcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/AutumnAtCabin/FloatVoltage', 28.0, 22.0, 32.0],
+                'profile_autumnatcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnAtCabin/AbsorptionTime', 5400, 0, 86400],
+                'profile_autumnatcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/AutumnAtCabin/FloatExitTime', 900, 0, 86400],
+                'profile_winteratcabin_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/WinterAtCabin/AbsorptionVoltage', 28.6, 22.0, 32.0],
+                'profile_winteratcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/WinterAtCabin/FloatVoltage', 28.2, 22.0, 32.0],
+                'profile_winteratcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterAtCabin/AbsorptionTime', 6300, 0, 86400],
+                'profile_winteratcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/WinterAtCabin/FloatExitTime', 900, 0, 86400],
+                'profile_springatcabin_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/AbsorptionVoltage', 28.3, 22.0, 32.0],
+                'profile_springatcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/FloatVoltage', 27.9, 22.0, 32.0],
+                'profile_springatcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/AbsorptionTime', 4800, 0, 86400],
+                'profile_springatcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/FloatExitTime', 900, 0, 86400],
                 # Season switch dates (format: "MM-DD")
                 'season_spring_start': ['/Settings/TristarMPPT/Season/SpringStart', '03-01', 0, 0],
                 'season_summer_start': ['/Settings/TristarMPPT/Season/SummerStart', '06-01', 0, 0],
@@ -427,6 +487,10 @@ class TriStarDriver:
         # Populate season/profile display paths from state
         self.dbus['/Custom/Season/CurrentSeason'] = self._get_current_season()
         self.dbus['/Custom/Season/ActiveProfile'] = self.state.get('active_profile', '')
+        self._update_planned_visit_soc()
+        self.dbus['/Custom/VoltageOverride/LastBalanceTimestamp'] = \
+            self.state['voltage_override'].get('last_balance_timestamp', '')
+        self.dbus['/Custom/VoltageOverride/BalanceComplete'] = False
 
         # Start periodic updates
         self._start_timer()
@@ -489,7 +553,8 @@ class TriStarDriver:
             "voltage_override": {
                 "time_used_today": 0,         # Seconds at override voltage today
                 "current_date": self._get_local_date(),  # Date for midnight reset
-                "stop_reason": ""             # Last stop reason
+                "stop_reason": "",            # Last stop reason
+                "last_balance_timestamp": ""  # ISO timestamp of last BatteryFull stop
             },
             "active_profile": "",       # Last successfully applied charge profile
             "last_known_season": ""     # Season at last profile auto-switch check
@@ -796,6 +861,8 @@ class TriStarDriver:
         s.add_path('/Custom/VoltageOverride/TimeAtTargetVoltage', 0, writeable=False)  # Seconds at target voltage
         s.add_path('/Custom/VoltageOverride/TailCurrentTimer', 0, writeable=False)  # Seconds
         s.add_path('/Custom/VoltageOverride/StopReason', "", writeable=False)  # Text: TimeLimit/BatteryFull/UserDisabled
+        s.add_path('/Custom/VoltageOverride/BalanceComplete', False, writeable=False)
+        s.add_path('/Custom/VoltageOverride/LastBalanceTimestamp', '', writeable=False)
         s.add_path('/Custom/VoltageOverride/CurrentVoltage', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")
         s.add_path('/Custom/VoltageOverride/RegisterReadback', 0.0, writeable=False, gettextcallback=lambda p, v: f"{v}V")  # Actual value read from PDU register 89 (vb_ref_slave)
 
@@ -830,6 +897,8 @@ class TriStarDriver:
         s.add_path('/Custom/ChargeProfile/LastApplied', '', writeable=False)
         s.add_path('/Custom/ChargeProfile/LastError', '', writeable=False)
         s.add_path('/Custom/ChargeProfile/ProgressPercent', 0, writeable=False)
+        s.add_path('/Custom/ChargeProfile/PlannedVisitSOC', 0, writeable=False,
+                   gettextcallback=lambda _, v: f"{v}%")
 
         # Season tracking (read-only display)
         s.add_path('/Custom/Season/CurrentSeason', '', writeable=False)
@@ -1050,8 +1119,9 @@ class TriStarDriver:
                 else:
                     logging.warning("Failed to read back PDU 89")
 
-            # Clear stop reason when user enables
+            # Clear stop reason and balance flag when user enables new override
             self.stop_reason = ""
+            self.dbus['/Custom/VoltageOverride/BalanceComplete'] = False
 
             # Return actual voltage that will be written (may differ slightly due to scaling)
             actual_voltage = self.register_to_voltage(register_value)
@@ -2136,6 +2206,10 @@ class TriStarDriver:
                             self.override_start_time = None
                             self.time_above_target_accumulated = 0
                             self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                            ts = datetime.now().isoformat(timespec='seconds')
+                            self.dbus['/Custom/VoltageOverride/BalanceComplete'] = True
+                            self.dbus['/Custom/VoltageOverride/LastBalanceTimestamp'] = ts
+                            self.state['voltage_override']['last_balance_timestamp'] = ts
                     else:
                         # Reset tail current timer if conditions not met
                         # (voltage not reached, current too high, or no excess power)
@@ -2352,8 +2426,19 @@ class TriStarDriver:
                     if active in REST_PROFILES:
                         logging.info(f"Season changed {last_season!r} → {new_season!r}, auto-applying {SEASON_TO_REST_PROFILE[new_season]}")
                         self._apply_rest_profile_for_season(new_season)
+                    elif active in SEASONAL_VISIT_PROFILES:
+                        # Re-apply same visit type for new season
+                        for vbase in _VISIT_BASES:
+                            if active.endswith(vbase):
+                                new_profile = SEASON_TO_VISIT_PROFILE[(new_season, vbase)]
+                                logging.info(f"Season changed {last_season!r} → {new_season!r}, re-applying visit profile: {active} → {new_profile}")
+                                threading.Thread(target=self._apply_charge_profile_async,
+                                                 args=(new_profile,), daemon=True).start()
+                                break
                     else:
-                        logging.info(f"Season changed {last_season!r} → {new_season!r}, but active='{active}' is a visit profile — skipping auto-switch")
+                        logging.info(f"Season changed {last_season!r} → {new_season!r}, active='{active}' — no auto-switch")
+                    self.dbus['/Custom/Season/CurrentSeason'] = new_season
+                    self._update_planned_visit_soc()
                     self._save_state()
 
         # Check if it's reset time (5-minute window to catch it)
@@ -2396,17 +2481,30 @@ class TriStarDriver:
         profile_file = Path("/data/dbus-tristar/charge_profiles.json")
 
         default_profiles = {
-            "version": 2,
+            "version": 3,
             "last_applied_profile": "",
             "last_applied_timestamp": "",
             "profiles": {
-                "summerrest":   {"EV_absorp": 27.4,  "EV_float": 27.2, "Et_absorp":  900, "Et_float_exit_cum": 7200},
-                "autumnrest":   {"EV_absorp": 27.8,  "EV_float": 27.6, "Et_absorp": 1800, "Et_float_exit_cum": 5400},
-                "winterrest":   {"EV_absorp": 28.0,  "EV_float": 27.8, "Et_absorp": 2700, "Et_float_exit_cum": 5400},
-                "springrest":   {"EV_absorp": 27.6,  "EV_float": 27.4, "Et_absorp": 1200, "Et_float_exit_cum": 7200},
-                "maybevisit":   {"EV_absorp": 28.1,  "EV_float": 27.8, "Et_absorp": 2700, "Et_float_exit_cum": 3600},
-                "plannedvisit": {"EV_absorp": 28.4,  "EV_float": 27.8, "Et_absorp": 3600, "Et_float_exit_cum": 1800},
-                "atcabin":      {"EV_absorp": 28.36, "EV_float": 28.0, "Et_absorp": 5400, "Et_float_exit_cum":  900},
+                # Rest profiles (seasonal, auto-switched)
+                "summerrest":         {"EV_absorp": 27.4,  "EV_float": 27.2, "Et_absorp":  900, "Et_float_exit_cum": 7200},
+                "autumnrest":         {"EV_absorp": 27.8,  "EV_float": 27.6, "Et_absorp": 1800, "Et_float_exit_cum": 5400},
+                "winterrest":         {"EV_absorp": 28.0,  "EV_float": 27.8, "Et_absorp": 2700, "Et_float_exit_cum": 5400},
+                "springrest":         {"EV_absorp": 27.6,  "EV_float": 27.4, "Et_absorp": 1200, "Et_float_exit_cum": 7200},
+                # MaybeVisit profiles (seasonal)
+                "summermaybevisit":   {"EV_absorp": 27.9,  "EV_float": 27.6, "Et_absorp": 2100, "Et_float_exit_cum": 3600},
+                "autumnmaybevisit":   {"EV_absorp": 28.1,  "EV_float": 27.8, "Et_absorp": 2700, "Et_float_exit_cum": 3600},
+                "wintermaybevisit":   {"EV_absorp": 28.3,  "EV_float": 28.0, "Et_absorp": 3600, "Et_float_exit_cum": 3600},
+                "springmaybevisit":   {"EV_absorp": 28.0,  "EV_float": 27.7, "Et_absorp": 2400, "Et_float_exit_cum": 3600},
+                # PlannedVisit profiles (seasonal)
+                "summerplannedvisit": {"EV_absorp": 28.2,  "EV_float": 27.6, "Et_absorp": 2700, "Et_float_exit_cum": 1800},
+                "autumnplannedvisit": {"EV_absorp": 28.4,  "EV_float": 27.8, "Et_absorp": 3600, "Et_float_exit_cum": 1800},
+                "winterplannedvisit": {"EV_absorp": 28.6,  "EV_float": 28.0, "Et_absorp": 4500, "Et_float_exit_cum": 1800},
+                "springplannedvisit": {"EV_absorp": 28.3,  "EV_float": 27.7, "Et_absorp": 3000, "Et_float_exit_cum": 1800},
+                # AtCabin profiles (seasonal)
+                "summeratcabin":      {"EV_absorp": 28.2,  "EV_float": 27.8, "Et_absorp": 4500, "Et_float_exit_cum":  900},
+                "autumnatcabin":      {"EV_absorp": 28.36, "EV_float": 28.0, "Et_absorp": 5400, "Et_float_exit_cum":  900},
+                "winteratcabin":      {"EV_absorp": 28.6,  "EV_float": 28.2, "Et_absorp": 6300, "Et_float_exit_cum":  900},
+                "springatcabin":      {"EV_absorp": 28.3,  "EV_float": 27.9, "Et_absorp": 4800, "Et_float_exit_cum":  900},
             }
         }
 
@@ -2415,28 +2513,35 @@ class TriStarDriver:
                 with open(profile_file, 'r') as f:
                     profiles = json.load(f)
 
-                # Migrate old 3-profile format (version 1: summer/winter/custom with EV_float_cancel)
+                file_version = profiles.get("version", 1)
+
+                # v1 migration: summer/winter/custom → 16 seasonal profiles
                 existing_names = set(profiles.get("profiles", {}).keys())
-                old_names = {'summer', 'winter', 'custom'}
-                if existing_names <= old_names:
-                    logging.info("Migrating charge_profiles.json from v1 (3 profiles) to v2 (7 profiles)")
-                    profiles["version"] = 2
+                if existing_names <= {'summer', 'winter', 'custom'}:
+                    logging.info("Migrating charge_profiles.json v1 → v3 (16 seasonal profiles)")
+                    profiles["version"] = 3
                     profiles["profiles"] = default_profiles["profiles"].copy()
                     profiles["last_applied_profile"] = ""
                     profiles["last_applied_timestamp"] = ""
-                    # Save migrated file
-                    try:
-                        with open(profile_file, 'w') as f:
-                            json.dump(profiles, f, indent=2)
-                        logging.info("Migrated charge_profiles.json saved")
-                    except Exception as save_err:
-                        logging.error(f"Failed to save migrated profiles: {save_err}")
+                    self._save_profiles_file(profile_file, profiles)
                     return profiles
 
-                # Merge defaults for any missing profiles
-                for profile_name, profile_data in default_profiles["profiles"].items():
-                    if profile_name not in profiles.get("profiles", {}):
-                        profiles["profiles"][profile_name] = profile_data
+                # v2 migration: replace 3 season-agnostic visit profiles with 12 seasonal ones
+                if file_version == 2:
+                    logging.info("Migrating charge_profiles.json v2 → v3 (seasonal visit profiles)")
+                    profiles["version"] = 3
+                    for old in ('maybevisit', 'plannedvisit', 'atcabin'):
+                        profiles["profiles"].pop(old, None)
+                    for name, data in default_profiles["profiles"].items():
+                        if name not in profiles["profiles"]:
+                            profiles["profiles"][name] = data
+                    self._save_profiles_file(profile_file, profiles)
+                    return profiles
+
+                # Merge any missing profiles (e.g. fresh install gaps)
+                for name, data in default_profiles["profiles"].items():
+                    if name not in profiles.get("profiles", {}):
+                        profiles["profiles"][name] = data
                 return profiles
         except Exception as e:
             logging.error(f"Failed to load charge profiles: {e}")
@@ -2453,9 +2558,10 @@ class TriStarDriver:
         return default_profiles
 
     def _remove_legacy_settings(self):
-        """Remove old Summer/Winter/Custom charge profile settings left over from v1"""
+        """Remove legacy charge profile settings (v1 Summer/Winter/Custom, v2 season-agnostic visit)"""
         # Paths use the localsettings internal format (without /Settings prefix)
         legacy_paths = [
+            # v1: Summer/Winter/Custom with FloatCancelVoltage
             '/TristarMPPT/ChargeProfiles/Summer/AbsorptionVoltage',
             '/TristarMPPT/ChargeProfiles/Summer/FloatVoltage',
             '/TristarMPPT/ChargeProfiles/Summer/AbsorptionTime',
@@ -2468,6 +2574,19 @@ class TriStarDriver:
             '/TristarMPPT/ChargeProfiles/Custom/FloatVoltage',
             '/TristarMPPT/ChargeProfiles/Custom/AbsorptionTime',
             '/TristarMPPT/ChargeProfiles/Custom/FloatCancelVoltage',
+            # v2: season-agnostic MaybeVisit/PlannedVisit/AtCabin
+            '/TristarMPPT/ChargeProfiles/MaybeVisit/AbsorptionVoltage',
+            '/TristarMPPT/ChargeProfiles/MaybeVisit/FloatVoltage',
+            '/TristarMPPT/ChargeProfiles/MaybeVisit/AbsorptionTime',
+            '/TristarMPPT/ChargeProfiles/MaybeVisit/FloatExitTime',
+            '/TristarMPPT/ChargeProfiles/PlannedVisit/AbsorptionVoltage',
+            '/TristarMPPT/ChargeProfiles/PlannedVisit/FloatVoltage',
+            '/TristarMPPT/ChargeProfiles/PlannedVisit/AbsorptionTime',
+            '/TristarMPPT/ChargeProfiles/PlannedVisit/FloatExitTime',
+            '/TristarMPPT/ChargeProfiles/AtCabin/AbsorptionVoltage',
+            '/TristarMPPT/ChargeProfiles/AtCabin/FloatVoltage',
+            '/TristarMPPT/ChargeProfiles/AtCabin/AbsorptionTime',
+            '/TristarMPPT/ChargeProfiles/AtCabin/FloatExitTime',
         ]
         try:
             bus = dbus.SystemBus()
@@ -2485,23 +2604,29 @@ class TriStarDriver:
             settings_obj = bus.get_object('com.victronenergy.settings', '/Settings')
             remove_settings = settings_obj.get_dbus_method('RemoveSettings', 'com.victronenergy.Settings')
             remove_settings(dbus.Array(existing, signature='s'))
-            logging.info(f"Removed {len(existing)} legacy charge profile settings (v1 → v2 migration)")
+            logging.info(f"Removed {len(existing)} legacy charge profile settings (v1/v2 → v3 migration)")
         except Exception as e:
             logging.debug(f"Legacy settings cleanup skipped: {e}")
 
-    def _save_charge_profiles(self):
-        """Save charge profiles to JSON file (atomic write)"""
-        profile_file = Path("/data/dbus-tristar/charge_profiles.json")
+    @staticmethod
+    def _save_profiles_file(profile_file, profiles):
+        """Atomic write of profiles dict to file (used by migration and normal save)"""
         temp_file = profile_file.with_suffix('.tmp')
-
         try:
             with open(temp_file, 'w') as f:
-                json.dump(self.charge_profiles, f, indent=2)
+                json.dump(profiles, f, indent=2)
             temp_file.replace(profile_file)
         except Exception as e:
             logging.error(f"Failed to save charge profiles: {e}")
             if temp_file.exists():
                 temp_file.unlink()
+
+    def _save_charge_profiles(self):
+        """Save charge profiles to JSON file (atomic write)"""
+        self._save_profiles_file(
+            Path("/data/dbus-tristar/charge_profiles.json"),
+            self.charge_profiles
+        )
 
     def _on_apply_profile_requested(self, path, value):
         """Callback when user writes to /Control/ApplyChargeProfile"""
@@ -2510,20 +2635,28 @@ class TriStarDriver:
         logging.debug(f"Parsed profile_name: '{profile_name}'")
 
         if not profile_name:
-            logging.error(f"Empty profile name after parsing")
+            logging.error("Empty profile name after parsing")
             return False
 
-        # 'rest' is a special alias: auto-select seasonal rest profile
+        # Resolve HA logical names to season-specific internal profile names
+        season = self._get_current_season()
         if profile_name == 'rest':
-            profile_name = SEASON_TO_REST_PROFILE[self._get_current_season()]
-            logging.info(f"'rest' resolved to '{profile_name}' for current season")
+            profile_name = SEASON_TO_REST_PROFILE[season]
+            logging.info(f"'rest' resolved to '{profile_name}' for season '{season}'")
+        elif profile_name in HA_VISIT_NAMES:
+            profile_name = SEASON_TO_VISIT_PROFILE[(season, profile_name)]
+            logging.info(f"'{str(value).lower().strip()}' resolved to '{profile_name}' for season '{season}'")
 
         if profile_name not in ALL_PROFILES:
-            valid = sorted(ALL_PROFILES) + ['rest']
-            error_msg = f"Invalid profile: '{profile_name}'. Valid: {valid}"
+            error_msg = f"Invalid profile: '{profile_name}'. HA names: {sorted(HA_VISIT_NAMES | {'rest'})}"
             self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
             logging.error(error_msg)
             return False
+
+        # Idempotency: skip if already active (prevents unnecessary EEPROM cycles on HA restart)
+        if profile_name == self.state.get('active_profile', ''):
+            logging.info(f"Profile '{profile_name}' is already active — no-op")
+            return True
 
         # Block if operation is in progress, but allow retry after success/failure
         if self.profile_apply_status not in ['idle', 'success', 'failed']:
@@ -2749,6 +2882,7 @@ class TriStarDriver:
             # Track active profile and update season display
             self.state['active_profile'] = profile_name
             self.dbus['/Custom/Season/ActiveProfile'] = profile_name
+            self._update_planned_visit_soc()
             self._save_state()
 
             logging.info(f"✅ Charge profile '{profile_name}' applied successfully ({len(changes)} changes)")
@@ -3075,6 +3209,33 @@ class TriStarDriver:
         threading.Thread(target=self._apply_charge_profile_async,
                         args=(profile_name,),
                         daemon=True).start()
+
+    @staticmethod
+    def _voltage_to_soc(voltage):
+        """Approximate SOC% from voltage using NMC 7S OCV table (piecewise linear)"""
+        table = NMC_7S_OCV_TABLE
+        if voltage <= table[0][0]:
+            return 0.0
+        if voltage >= table[-1][0]:
+            return 100.0
+        for i in range(len(table) - 1):
+            v0, s0 = table[i]
+            v1, s1 = table[i + 1]
+            if v0 <= voltage <= v1:
+                return round(s0 + (voltage - v0) / (v1 - v0) * (s1 - s0), 1)
+        return 100.0
+
+    def _update_planned_visit_soc(self):
+        """Recalculate and publish PlannedVisitSOC for current season's plannedvisit profile"""
+        try:
+            season = self._get_current_season()
+            key = f'profile_{season}plannedvisit_absorption_v'
+            abs_v = float(self.settings[key])
+            soc = self._voltage_to_soc(abs_v)
+            self.dbus['/Custom/ChargeProfile/PlannedVisitSOC'] = soc
+            logging.debug(f"PlannedVisitSOC: {season}plannedvisit EV_absorp={abs_v}V → {soc}%")
+        except Exception as e:
+            logging.warning(f"Could not calculate PlannedVisitSOC: {e}")
 
     def _reconnect_modbus(self):
         """Re-establish Modbus connection after reset"""

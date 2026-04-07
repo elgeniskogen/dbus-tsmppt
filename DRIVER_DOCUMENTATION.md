@@ -1,6 +1,6 @@
 # TriStar MPPT Driver - Complete Documentation
 
-**Version:** 2.26
+**Version:** 2.36
 **Author:** dbus-tristar driver
 **Target:** Morningstar TriStar MPPT 60 via Modbus TCP
 
@@ -129,7 +129,7 @@ ExcessPowerThreshold      = 100            (Minimum excess power in W, range: -1
 
 #### Charge Profile Settings
 
-Seven profiles in two categories. All four parameters per profile, all ranges identical.
+Sixteen profiles in two categories: 4 rest + 12 seasonal visit. All four parameters per profile, all ranges identical.
 
 **Rest profiles** (seasonal maintenance, auto-applied at 02:30 when season changes):
 ```
@@ -154,22 +154,75 @@ ChargeProfiles/SpringRest/AbsorptionTime      = 1200  (seconds, range: 0-86400)
 ChargeProfiles/SpringRest/FloatExitTime       = 7200  (seconds, range: 0-86400)
 ```
 
-**Visit profiles** (manually activated, never auto-switched away from):
+**Visit profiles** (manually activated via HA logical names — see Control Paths). 12 seasonal variants; colder seasons use higher voltages to compensate for OCV shift. Auto-switch at 02:30 re-applies the same visit type for the new season.
+
+*MaybeVisit* (possibly arriving soon, ~75-82% SOC target):
 ```
-ChargeProfiles/MaybeVisit/AbsorptionVoltage   = 28.1  (V, ~78-82% SOC, range: 22.0-32.0)
-ChargeProfiles/MaybeVisit/FloatVoltage        = 27.8  (V, ~65-70% SOC, range: 22.0-32.0)
-ChargeProfiles/MaybeVisit/AbsorptionTime      = 2700  (seconds, range: 0-86400)
-ChargeProfiles/MaybeVisit/FloatExitTime       = 3600  (seconds, range: 0-86400)
+ChargeProfiles/SummerMaybeVisit/AbsorptionVoltage = 27.9  (V, range: 22.0-32.0)
+ChargeProfiles/SummerMaybeVisit/FloatVoltage      = 27.6  (V, range: 22.0-32.0)
+ChargeProfiles/SummerMaybeVisit/AbsorptionTime    = 2100  (seconds, range: 0-86400)
+ChargeProfiles/SummerMaybeVisit/FloatExitTime     = 3600  (seconds, range: 0-86400)
 
-ChargeProfiles/PlannedVisit/AbsorptionVoltage = 28.4  (V, ~88-92% SOC, range: 22.0-32.0)
-ChargeProfiles/PlannedVisit/FloatVoltage      = 27.8  (V, ~65-70% SOC, range: 22.0-32.0)
-ChargeProfiles/PlannedVisit/AbsorptionTime    = 3600  (seconds, range: 0-86400)
-ChargeProfiles/PlannedVisit/FloatExitTime     = 1800  (seconds, range: 0-86400)
+ChargeProfiles/AutumnMaybeVisit/AbsorptionVoltage = 28.1  (V, range: 22.0-32.0)
+ChargeProfiles/AutumnMaybeVisit/FloatVoltage      = 27.8  (V, range: 22.0-32.0)
+ChargeProfiles/AutumnMaybeVisit/AbsorptionTime    = 2700  (seconds, range: 0-86400)
+ChargeProfiles/AutumnMaybeVisit/FloatExitTime     = 3600  (seconds, range: 0-86400)
 
-ChargeProfiles/AtCabin/AbsorptionVoltage      = 28.36 (V, ~85-90% SOC, range: 22.0-32.0)
-ChargeProfiles/AtCabin/FloatVoltage           = 28.0  (V, ~75-80% SOC, range: 22.0-32.0)
-ChargeProfiles/AtCabin/AbsorptionTime         = 5400  (seconds, range: 0-86400)
-ChargeProfiles/AtCabin/FloatExitTime          =  900  (seconds, range: 0-86400)
+ChargeProfiles/WinterMaybeVisit/AbsorptionVoltage = 28.3  (V, range: 22.0-32.0)
+ChargeProfiles/WinterMaybeVisit/FloatVoltage      = 28.0  (V, range: 22.0-32.0)
+ChargeProfiles/WinterMaybeVisit/AbsorptionTime    = 3600  (seconds, range: 0-86400)
+ChargeProfiles/WinterMaybeVisit/FloatExitTime     = 3600  (seconds, range: 0-86400)
+
+ChargeProfiles/SpringMaybeVisit/AbsorptionVoltage = 28.0  (V, range: 22.0-32.0)
+ChargeProfiles/SpringMaybeVisit/FloatVoltage      = 27.7  (V, range: 22.0-32.0)
+ChargeProfiles/SpringMaybeVisit/AbsorptionTime    = 2400  (seconds, range: 0-86400)
+ChargeProfiles/SpringMaybeVisit/FloatExitTime     = 3600  (seconds, range: 0-86400)
+```
+
+*PlannedVisit* (trip confirmed, charge up in advance, ~85-92% SOC target):
+```
+ChargeProfiles/SummerPlannedVisit/AbsorptionVoltage = 28.2  (V, range: 22.0-32.0)
+ChargeProfiles/SummerPlannedVisit/FloatVoltage      = 27.6  (V, range: 22.0-32.0)
+ChargeProfiles/SummerPlannedVisit/AbsorptionTime    = 2700  (seconds, range: 0-86400)
+ChargeProfiles/SummerPlannedVisit/FloatExitTime     = 1800  (seconds, range: 0-86400)
+
+ChargeProfiles/AutumnPlannedVisit/AbsorptionVoltage = 28.4  (V, range: 22.0-32.0)
+ChargeProfiles/AutumnPlannedVisit/FloatVoltage      = 27.8  (V, range: 22.0-32.0)
+ChargeProfiles/AutumnPlannedVisit/AbsorptionTime    = 3600  (seconds, range: 0-86400)
+ChargeProfiles/AutumnPlannedVisit/FloatExitTime     = 1800  (seconds, range: 0-86400)
+
+ChargeProfiles/WinterPlannedVisit/AbsorptionVoltage = 28.6  (V, range: 22.0-32.0)
+ChargeProfiles/WinterPlannedVisit/FloatVoltage      = 28.0  (V, range: 22.0-32.0)
+ChargeProfiles/WinterPlannedVisit/AbsorptionTime    = 4500  (seconds, range: 0-86400)
+ChargeProfiles/WinterPlannedVisit/FloatExitTime     = 1800  (seconds, range: 0-86400)
+
+ChargeProfiles/SpringPlannedVisit/AbsorptionVoltage = 28.3  (V, range: 22.0-32.0)
+ChargeProfiles/SpringPlannedVisit/FloatVoltage      = 27.7  (V, range: 22.0-32.0)
+ChargeProfiles/SpringPlannedVisit/AbsorptionTime    = 3000  (seconds, range: 0-86400)
+ChargeProfiles/SpringPlannedVisit/FloatExitTime     = 1800  (seconds, range: 0-86400)
+```
+
+*AtCabin* (currently at the cabin, keep battery topped up, ~88-95% SOC target):
+```
+ChargeProfiles/SummerAtCabin/AbsorptionVoltage = 28.2   (V, range: 22.0-32.0)
+ChargeProfiles/SummerAtCabin/FloatVoltage      = 27.8   (V, range: 22.0-32.0)
+ChargeProfiles/SummerAtCabin/AbsorptionTime    = 4500   (seconds, range: 0-86400)
+ChargeProfiles/SummerAtCabin/FloatExitTime     =  900   (seconds, range: 0-86400)
+
+ChargeProfiles/AutumnAtCabin/AbsorptionVoltage = 28.36  (V, range: 22.0-32.0)
+ChargeProfiles/AutumnAtCabin/FloatVoltage      = 28.0   (V, range: 22.0-32.0)
+ChargeProfiles/AutumnAtCabin/AbsorptionTime    = 5400   (seconds, range: 0-86400)
+ChargeProfiles/AutumnAtCabin/FloatExitTime     =  900   (seconds, range: 0-86400)
+
+ChargeProfiles/WinterAtCabin/AbsorptionVoltage = 28.6   (V, range: 22.0-32.0)
+ChargeProfiles/WinterAtCabin/FloatVoltage      = 28.2   (V, range: 22.0-32.0)
+ChargeProfiles/WinterAtCabin/AbsorptionTime    = 6300   (seconds, range: 0-86400)
+ChargeProfiles/WinterAtCabin/FloatExitTime     =  900   (seconds, range: 0-86400)
+
+ChargeProfiles/SpringAtCabin/AbsorptionVoltage = 28.3   (V, range: 22.0-32.0)
+ChargeProfiles/SpringAtCabin/FloatVoltage      = 27.9   (V, range: 22.0-32.0)
+ChargeProfiles/SpringAtCabin/AbsorptionTime    = 4800   (seconds, range: 0-86400)
+ChargeProfiles/SpringAtCabin/FloatExitTime     =  900   (seconds, range: 0-86400)
 ```
 
 **Season start dates** (MM-DD format, configurable):
@@ -188,6 +241,7 @@ Season/WinterStart  = "12-01"   (1st December)
 ```bash
 dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/AbsorptionVoltage SetValue 28.4
 dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatExitTime SetValue 9000
+dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/AutumnPlannedVisit/AbsorptionVoltage SetValue 28.5
 ```
 
 **Example:** Change autumn start date to October 1st
@@ -238,14 +292,20 @@ Located at: `venus-home/N/.../solarcharger/0/Control/...`
 #### Charge Profile Management
 ```
 /Control/ApplyChargeProfile     WRITEABLE (text)
-  "rest"         = Auto-select current season's rest profile (recommended)
-  "summerrest"   = Apply SummerRest profile
-  "autumnrest"   = Apply AutumnRest profile
-  "winterrest"   = Apply WinterRest profile
-  "springrest"   = Apply SpringRest profile
-  "maybevisit"   = Apply MaybeVisit profile
-  "plannedvisit" = Apply PlannedVisit profile
-  "atcabin"      = Apply AtCabin profile
+
+  Home Assistant logical names (recommended — driver maps to current season):
+  "rest"          = Auto-select current season's rest profile
+  "maybevisit"    = Apply current season's MaybeVisit profile
+  "plannedvisit"  = Apply current season's PlannedVisit profile
+  "atcabin"       = Apply current season's AtCabin profile
+
+  Direct profile names (bypass seasonal mapping):
+  "summerrest" | "autumnrest" | "winterrest" | "springrest"
+  "summermaybevisit" | "autumnmaybevisit" | "wintermaybevisit" | "springmaybevisit"
+  "summerplannedvisit" | "autumnplannedvisit" | "winterplannedvisit" | "springplannedvisit"
+  "summeratcabin" | "autumnatcabin" | "winteratcabin" | "springatcabin"
+
+  Idempotency: If the requested profile is already active, the write is skipped.
 
   Effect: Writes charge parameters to EEPROM with safety checks
   Safety: DISCONNECT → Write → Verify → Reset controller
@@ -320,7 +380,16 @@ Located at: `venus-home/N/.../solarcharger/0/Custom/...`
 #### Seasonal Profile Status
 ```
 /Custom/Season/CurrentSeason                (text) - Current season: "summer"|"autumn"|"winter"|"spring"
-/Custom/Season/ActiveProfile                (text) - Last successfully applied profile name
+/Custom/Season/ActiveProfile                (text) - Last successfully applied profile name (e.g. "autumnrest")
+/Custom/ChargeProfile/PlannedVisitSOC       (%) - Estimated SOC at current season's PlannedVisit absorption voltage
+                                                   Based on NMC 7S OCV table at 15°C
+```
+
+#### Balance Tracking
+```
+/Custom/VoltageOverride/BalanceComplete     (bool) - True if BatteryFull detected during last VoltageOverride session
+/Custom/VoltageOverride/LastBalanceTimestamp (text) - ISO-8601 timestamp of last BatteryFull event, e.g. "2026-04-01T14:23:05"
+                                                      Empty string if no balance has occurred
 ```
 
 #### Battery & Internal Monitoring
@@ -560,19 +629,27 @@ Switch between seasonal battery charging profiles by safely programming EEPROM c
 
 ### Profile Categories
 
-**Rest profiles** (cabin unoccupied — maintenance charging):
-- `summerrest` — Gentle maintenance, lowest voltages
-- `autumnrest` — Moderate maintenance
-- `winterrest` — Higher voltage to overcome cold temperatures
-- `springrest` — Same as autumnrest
+**Rest profiles** (cabin unoccupied — maintenance charging, 4 total):
+- `summerrest` — Gentle maintenance, lowest voltages (~55% SOC)
+- `autumnrest` — Moderate maintenance (~65% SOC)
+- `winterrest` — Higher voltage for cold temperatures (~75% SOC)
+- `springrest` — Gentle spring maintenance (~60% SOC)
 
-**Visit profiles** (manual activation only — never auto-switched away from):
-- `maybevisit` — Possibly arriving soon
-- `plannedvisit` — Trip confirmed, charge up in advance
-- `atcabin` — Currently at the cabin
+**Visit profiles** (manual activation via HA logical names, 12 total = 4 seasons × 3 types):
+- `maybevisit` — Possibly arriving soon (~75-82% SOC target)
+- `plannedvisit` — Trip confirmed, charge up in advance (~85-92% SOC target)
+- `atcabin` — Currently at the cabin, keep topped up (~88-95% SOC target)
+
+Each visit type exists in four seasonal variants (e.g. `summermaybevisit`, `autumnmaybevisit`, etc.) with voltages adjusted for temperature-dependent OCV shifts. When using HA logical names the driver automatically selects the correct seasonal variant.
 
 ### Seasonal Auto-Switch
-At 02:30 local time the driver checks whether the season has changed. If yes **and** the active profile is a rest profile, the new season's rest profile is applied automatically. If a visit profile is active, the switch is skipped (logged) and will apply on the next manual `rest` command.
+
+At 02:30 local time the driver checks whether the season has changed. Two cases:
+
+1. **Rest profile active:** New season's rest profile is applied automatically.
+2. **Visit profile active:** The same visit type is re-applied for the new season (e.g. `autumnplannedvisit` → `winterplannedvisit`). This keeps the correct SOC target but adjusts for cold-weather OCV.
+
+If the season hasn't changed, no action is taken.
 
 Season boundaries are configurable (default: Spring=Mar 1, Summer=Jun 1, Autumn=Sep 1, Winter=Dec 1).
 
@@ -594,18 +671,21 @@ dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRe
 dbus -y com.victronenergy.settings /Settings/TristarMPPT/ChargeProfiles/WinterRest/FloatExitTime SetValue 9000
 ```
 
-All seven profiles are fully customizable via D-Bus Settings.
+All sixteen profiles are fully customizable via D-Bus Settings.
 
 #### 2. Apply Profile
 ```bash
-# Auto-select rest profile for current season (recommended)
+# Auto-select rest profile for current season
 dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "rest"
 
-# Apply specific profile
+# Apply current season's PlannedVisit profile (e.g. autumnplannedvisit in autumn)
 dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "plannedvisit"
 
-# Via MQTT (Home Assistant)
-mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile" -m '{"value": "rest"}'
+# Apply a specific seasonal profile directly
+dbus -y com.victronenergy.solarcharger.tristar_0 /Control/ApplyChargeProfile SetValue "winteratcabin"
+
+# Via MQTT (Home Assistant) — use HA logical names
+mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile" -m '{"value": "plannedvisit"}'
 ```
 
 #### 3. Driver Executes Safe EEPROM Write Procedure
@@ -708,10 +788,25 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Season/CurrentSeason Ge
 # Returns: "summer", "autumn", "winter", or "spring"
 
 dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Season/ActiveProfile GetValue
-# Returns last applied profile name, e.g. "autumnrest"
+# Returns last applied profile name, e.g. "autumnrest" or "winterplannedvisit"
+
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/PlannedVisitSOC GetValue
+# Returns estimated SOC% at current season's PlannedVisit absorption voltage (NMC 7S OCV @ 15°C)
 ```
 
 These values update automatically after successful profile apply.
+
+#### Balance Tracking
+```bash
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/BalanceComplete GetValue
+# Returns: True if last VoltageOverride session ended with BatteryFull detection
+
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/LastBalanceTimestamp GetValue
+# Returns: ISO-8601 timestamp of last successful balance, e.g. "2026-04-01T14:23:05"
+# Returns empty string if no balance has occurred
+
+# Note: BalanceComplete resets to False when a new VoltageOverride session starts
+```
 
 ### Safety Features
 1. **Parameter validation** - Ensures float < absorption, values in safe ranges
@@ -722,7 +817,7 @@ These values update automatically after successful profile apply.
 6. **Voltage limits** - Enforced in Settings (22.0-32.0V for all voltage params)
 7. **Smart retry** - Control path resets to '' after each operation, allows immediate retry
 8. **Status tracking** - ApplyStatus prevents concurrent operations
-9. **Visit profile protection** - Seasonal auto-switch never overrides a visit profile
+9. **Idempotency** - If the requested profile is already active, the EEPROM write is skipped entirely (no unnecessary EEPROM cycles)
 
 ### Typical Operation Time
 - **No changes:** < 1 second (validation only)
@@ -743,9 +838,12 @@ If operation fails:
 - User can retry after fixing issue (status resets to "idle" on next attempt)
 
 ### Home Assistant Integration Example
+
+The driver accepts four HA logical names. The seasonal variant is resolved automatically by the driver based on the current season.
+
 ```yaml
-# Apply visit profile when planning a trip
 automation:
+  # Trip confirmed — charge up in advance (driver picks summerplannedvisit / autumnplannedvisit etc.)
   - alias: "Planned cabin visit - charge up"
     action:
       - service: mqtt.publish
@@ -753,15 +851,40 @@ automation:
           topic: "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile"
           payload: '{"value": "plannedvisit"}'
 
+  # Left the cabin — return to seasonal maintenance
   - alias: "Back from cabin - return to seasonal rest"
     action:
       - service: mqtt.publish
         data:
           topic: "W/<portal-id>/solarcharger/0/Control/ApplyChargeProfile"
           payload: '{"value": "rest"}'
+
+  # Monthly cell balance — trigger equalization override
+  - alias: "Monthly cell balance"
+    action:
+      - service: mqtt.publish
+        data:
+          topic: "W/<portal-id>/solarcharger/0/Control/VoltageOverride"
+          payload: '{"value": 28.7}'
 ```
 
-**Note:** Seasonal switching (rest profiles) is handled automatically by the driver at 02:30 local time. No Home Assistant automation needed for seasonal switching.
+**Check balance status:**
+```bash
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/BalanceComplete GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/LastBalanceTimestamp GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/PlannedVisitSOC GetValue
+```
+
+**Check current season and active profile:**
+```bash
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Season/CurrentSeason GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/Season/ActiveProfile GetValue
+```
+
+**Notes:**
+- Seasonal rest switching is handled automatically at 02:30 local time — no HA automation needed.
+- Visit profile auto-switch at 02:30 re-applies the same type for the new season (e.g. `autumnmaybevisit` → `wintermaybevisit`).
+- Same-profile writes are no-ops (idempotent) — safe to re-send from HA without causing unnecessary EEPROM cycles.
 
 ---
 
