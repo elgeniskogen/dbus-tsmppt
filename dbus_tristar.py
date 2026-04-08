@@ -140,7 +140,8 @@ REST_PROFILES = {'summerrest', 'autumnrest', 'winterrest', 'springrest'}
 _SEASONS = ('summer', 'autumn', 'winter', 'spring')
 _VISIT_BASES = ('maybevisit', 'plannedvisit', 'atcabin')
 SEASONAL_VISIT_PROFILES = {f'{s}{v}' for s in _SEASONS for v in _VISIT_BASES}
-ALL_PROFILES = REST_PROFILES | SEASONAL_VISIT_PROFILES
+GLOBAL_PROFILES = {'chargeto100'}  # Season-independent profiles
+ALL_PROFILES = REST_PROFILES | SEASONAL_VISIT_PROFILES | GLOBAL_PROFILES
 
 # HA sends only these logical names; driver resolves to seasonal variant
 HA_VISIT_NAMES = frozenset(_VISIT_BASES)
@@ -323,6 +324,11 @@ class TriStarDriver:
                 'profile_springatcabin_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/FloatVoltage', 27.9, 22.0, 32.0],
                 'profile_springatcabin_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/AbsorptionTime', 4800, 0, 86400],
                 'profile_springatcabin_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/SpringAtCabin/FloatExitTime', 900, 0, 86400],
+                # Global profiles (season-independent)
+                'profile_chargeto100_absorption_v':    ['/Settings/TristarMPPT/ChargeProfiles/ChargeTo100/AbsorptionVoltage', 28.7, 22.0, 32.0],
+                'profile_chargeto100_float_v':         ['/Settings/TristarMPPT/ChargeProfiles/ChargeTo100/FloatVoltage', 28.5, 22.0, 32.0],
+                'profile_chargeto100_absorption_time': ['/Settings/TristarMPPT/ChargeProfiles/ChargeTo100/AbsorptionTime', 3600, 0, 86400],
+                'profile_chargeto100_float_exit_time': ['/Settings/TristarMPPT/ChargeProfiles/ChargeTo100/FloatExitTime', 900, 0, 86400],
                 # Season switch dates (format: "MM-DD")
                 'season_spring_start': ['/Settings/TristarMPPT/Season/SpringStart', '03-01', 0, 0],
                 'season_summer_start': ['/Settings/TristarMPPT/Season/SummerStart', '06-01', 0, 0],
@@ -895,7 +901,7 @@ class TriStarDriver:
         s.add_path('/Control/ApplyChargeProfile', '', writeable=True, onchangecallback=self._on_apply_profile_requested)
         s.add_path('/Custom/ChargeProfile/ApplyStatus', 'idle', writeable=False)
         s.add_path('/Custom/ChargeProfile/LastApplied', '', writeable=False)
-        s.add_path('/Custom/ChargeProfile/LastError', '', writeable=False)
+        s.add_path('/Custom/ChargeProfile/StatusDetail', '', writeable=False)
         s.add_path('/Custom/ChargeProfile/ProgressPercent', 0, writeable=False)
         s.add_path('/Custom/ChargeProfile/PlannedVisitSOC', 0, writeable=False,
                    gettextcallback=lambda _, v: f"{v}%")
@@ -1074,10 +1080,10 @@ class TriStarDriver:
                 self.time_above_target_accumulated = 0
                 logging.info("Voltage override disabled by user")
                 # Immediately write -1 to disable slave mode
-                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
                 # Also clear array voltage registers to ensure MPPT is enabled
-                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed
-                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct
+                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed (-1/0xFFFF = disable)
+                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct (-1/0xFFFF = disable)
                 # Update D-Bus paths immediately to show disabled
                 self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
                 self.dbus['/Custom/VoltageOverride/Active'] = False
@@ -1146,11 +1152,11 @@ class TriStarDriver:
                 logging.info("Current override disabled by user - also disabling voltage override (TriStar requires both)")
                 # Immediately write -1 to BOTH registers to disable slave mode
                 # (TriStar requires both registers to be maintained together)
-                self.write_holding_register(88, -1)  # PDU 88 = Ib_ref_slave
-                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                self.write_holding_register(88, -1)  # PDU 88 = Ib_ref_slave (-1/0xFFFF = disable slave mode)
+                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
                 # Also clear array voltage registers to ensure MPPT is enabled
-                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed
-                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct
+                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed (-1/0xFFFF = disable)
+                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct (-1/0xFFFF = disable)
                 # Also disable voltage override
                 self.pending_voltage_override = None
                 self.voltage_override_active = False
@@ -2181,7 +2187,7 @@ class TriStarDriver:
                     self.override_start_time = None
                     self.tail_current_start_time = None
                     self.time_above_target_accumulated = 0
-                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
 
                 # Safety check 2: Battery full (tail current)?
                 # Check voltage at target AND (excess power OR disabled) AND low current
@@ -2205,7 +2211,7 @@ class TriStarDriver:
                             self.tail_current_start_time = None
                             self.override_start_time = None
                             self.time_above_target_accumulated = 0
-                            self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                            self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
                             ts = datetime.now().isoformat(timespec='seconds')
                             self.dbus['/Custom/VoltageOverride/BalanceComplete'] = True
                             self.dbus['/Custom/VoltageOverride/LastBalanceTimestamp'] = ts
@@ -2456,7 +2462,7 @@ class TriStarDriver:
                     self.pending_voltage_override = None
                     self.voltage_override_active = False
                     self.stop_reason = "NightlyReset"
-                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave
+                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
 
                 # 2. Reset cumulative time counter (fresh start for new day)
                 if self.time_above_target_accumulated > 0:
@@ -2505,6 +2511,8 @@ class TriStarDriver:
                 "autumnatcabin":      {"EV_absorp": 28.36, "EV_float": 28.0, "Et_absorp": 5400, "Et_float_exit_cum":  900},
                 "winteratcabin":      {"EV_absorp": 28.6,  "EV_float": 28.2, "Et_absorp": 6300, "Et_float_exit_cum":  900},
                 "springatcabin":      {"EV_absorp": 28.3,  "EV_float": 27.9, "Et_absorp": 4800, "Et_float_exit_cum":  900},
+                # Global profiles (season-independent)
+                "chargeto100":        {"EV_absorp": 28.7,  "EV_float": 28.5, "Et_absorp": 3600, "Et_float_exit_cum":  900},
             }
         }
 
@@ -2649,7 +2657,7 @@ class TriStarDriver:
 
         if profile_name not in ALL_PROFILES:
             error_msg = f"Invalid profile: '{profile_name}'. HA names: {sorted(HA_VISIT_NAMES | {'rest'})}"
-            self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
+            self.dbus['/Custom/ChargeProfile/StatusDetail'] = error_msg
             logging.error(error_msg)
             return False
 
@@ -2661,7 +2669,7 @@ class TriStarDriver:
         # Block if operation is in progress, but allow retry after success/failure
         if self.profile_apply_status not in ['idle', 'success', 'failed']:
             error_msg = f"Profile apply already in progress (status: {self.profile_apply_status})"
-            self.dbus['/Custom/ChargeProfile/LastError'] = error_msg
+            self.dbus['/Custom/ChargeProfile/StatusDetail'] = error_msg
             logging.warning(error_msg)
             return False
 
@@ -2783,7 +2791,7 @@ class TriStarDriver:
 
             if not changes:
                 logging.info(f"Profile '{profile_name}' already matches EEPROM, no changes needed")
-                self._update_profile_status("success", 100, "")
+                self._update_profile_status("success", 100, "success (no changes needed)")
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.dbus['/Custom/ChargeProfile/LastApplied'] = f"{profile_name} (no changes) at {timestamp}"
                 self._save_charge_profiles()
@@ -2867,7 +2875,7 @@ class TriStarDriver:
             self._update_active_eeprom_display(final_eeprom)
 
             # Step 13: Success!
-            self._update_profile_status("success", 100, "")
+            self._update_profile_status("success", 100, "success")
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.dbus['/Custom/ChargeProfile/LastApplied'] = f"{profile_name} at {timestamp}"
 
@@ -2924,16 +2932,15 @@ class TriStarDriver:
             self.main_loop_paused_reason = ""
             logging.info("Main update loop resumed")
 
-    def _update_profile_status(self, status, progress, error):
+    def _update_profile_status(self, status, progress, message):
         """Update D-Bus status paths for profile apply operation"""
         self.profile_apply_status = status
         self.profile_apply_progress = progress
-        self.profile_apply_error = error
+        self.profile_apply_error = message
 
         self.dbus['/Custom/ChargeProfile/ApplyStatus'] = status
         self.dbus['/Custom/ChargeProfile/ProgressPercent'] = progress
-        if error:
-            self.dbus['/Custom/ChargeProfile/LastError'] = error
+        self.dbus['/Custom/ChargeProfile/StatusDetail'] = message
 
     def _get_profile_from_settings(self, profile_name):
         """Read profile values from D-Bus Settings"""

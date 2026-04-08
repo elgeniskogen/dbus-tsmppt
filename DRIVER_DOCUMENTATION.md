@@ -129,7 +129,7 @@ ExcessPowerThreshold      = 100            (Minimum excess power in W, range: -1
 
 #### Charge Profile Settings
 
-Sixteen profiles in two categories: 4 rest + 12 seasonal visit. All four parameters per profile, all ranges identical.
+Seventeen profiles in three categories: 4 rest + 12 seasonal visit + 1 global. All four parameters per profile, all ranges identical.
 
 **Rest profiles** (seasonal maintenance, auto-applied at 02:30 when season changes):
 ```
@@ -225,6 +225,14 @@ ChargeProfiles/SpringAtCabin/AbsorptionTime    = 4800   (seconds, range: 0-86400
 ChargeProfiles/SpringAtCabin/FloatExitTime     =  900   (seconds, range: 0-86400)
 ```
 
+**Global profile** (season-independent, manual activation only):
+```
+ChargeProfiles/ChargeTo100/AbsorptionVoltage  = 28.7  (V, 100% SOC, range: 22.0-32.0)
+ChargeProfiles/ChargeTo100/FloatVoltage       = 28.5  (V, ~97-98% SOC, range: 22.0-32.0)
+ChargeProfiles/ChargeTo100/AbsorptionTime     = 3600  (seconds, range: 0-86400)
+ChargeProfiles/ChargeTo100/FloatExitTime      =  900  (seconds, range: 0-86400)
+```
+
 **Season start dates** (MM-DD format, configurable):
 ```
 Season/SpringStart  = "03-01"   (1st March)
@@ -304,6 +312,7 @@ Located at: `venus-home/N/.../solarcharger/0/Control/...`
   "summermaybevisit" | "autumnmaybevisit" | "wintermaybevisit" | "springmaybevisit"
   "summerplannedvisit" | "autumnplannedvisit" | "winterplannedvisit" | "springplannedvisit"
   "summeratcabin" | "autumnatcabin" | "winteratcabin" | "springatcabin"
+  "chargeto100"
 
   Idempotency: If the requested profile is already active, the write is skipped.
 
@@ -373,7 +382,10 @@ Located at: `venus-home/N/.../solarcharger/0/Custom/...`
 /Custom/ChargeProfile/ApplyStatus           (text) - Profile apply operation status
   Values: "idle", "validating", "disconnecting", "writing", "resetting", "success", "failed"
 /Custom/ChargeProfile/ProgressPercent       (%) - Apply operation progress (0-100)
-/Custom/ChargeProfile/LastError             (text) - Last error message (if failed)
+/Custom/ChargeProfile/StatusDetail          (text) - Human-readable detail for current/last operation
+  During apply: step description (e.g. "Writing EEPROM parameters...")
+  On success:   "success" or "success (no changes needed)"
+  On failure:   error message
 /Custom/ChargeProfile/LastApplied           (text) - "profile_name at YYYY-MM-DD HH:MM:SS"
 ```
 
@@ -635,6 +647,9 @@ Switch between seasonal battery charging profiles by safely programming EEPROM c
 - `winterrest` — Higher voltage for cold temperatures (~75% SOC)
 - `springrest` — Gentle spring maintenance (~60% SOC)
 
+**Global profiles** (season-independent, manual activation only, 1 total):
+- `chargeto100` — Charge to 100% SOC (28.7V abs, 28.5V float). Use when you want a full battery. Follow up with `rest` or `atcabin` afterwards.
+
 **Visit profiles** (manual activation via HA logical names, 12 total = 4 seasons × 3 types):
 - `maybevisit` — Possibly arriving soon (~75-82% SOC target)
 - `plannedvisit` — Trip confirmed, charge up in advance (~85-92% SOC target)
@@ -766,7 +781,7 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/ProgressP
 # Returns: 0-100
 
 # Check for errors
-dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/LastError GetValue
+dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/StatusDetail GetValue
 
 # Check what was last applied
 dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/ChargeProfile/LastApplied GetValue
@@ -832,7 +847,7 @@ dbus -y com.victronenergy.solarcharger.tristar_0 /Custom/VoltageOverride/LastBal
 ### Error Handling
 If operation fails:
 - Status set to "failed"
-- Error message available in LastError path
+- Error message available in StatusDetail path
 - Controller attempts to re-enable charging (clear DISCONNECT)
 - Main loop resumes (driver continues normal operation)
 - User can retry after fixing issue (status resets to "idle" on next attempt)
