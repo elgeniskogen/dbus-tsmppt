@@ -1080,10 +1080,10 @@ class TriStarDriver:
                 self.time_above_target_accumulated = 0
                 logging.info("Voltage override disabled by user")
                 # Immediately write -1 to disable slave mode
-                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
+                self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
                 # Also clear array voltage registers to ensure MPPT is enabled
-                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed (-1/0xFFFF = disable)
-                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct (-1/0xFFFF = disable)
+                self.write_holding_register(90, -16)  # PDU 90 = va_ref_fixed (0xFFF0 = disable)
+                self.write_holding_register(91, -16)  # PDU 91 = va_ref_fixed_pct (0xFFF0 = disable)
                 # Update D-Bus paths immediately to show disabled
                 self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
                 self.dbus['/Custom/VoltageOverride/Active'] = False
@@ -1152,11 +1152,11 @@ class TriStarDriver:
                 logging.info("Current override disabled by user - also disabling voltage override (TriStar requires both)")
                 # Immediately write -1 to BOTH registers to disable slave mode
                 # (TriStar requires both registers to be maintained together)
-                self.write_holding_register(88, -1)  # PDU 88 = Ib_ref_slave (-1/0xFFFF = disable slave mode)
-                self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
+                self.write_holding_register(88, -16)  # PDU 88 = Ib_ref_slave (0xFFF0 = disable slave mode)
+                self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
                 # Also clear array voltage registers to ensure MPPT is enabled
-                self.write_holding_register(90, -1)  # PDU 90 = va_ref_fixed (-1/0xFFFF = disable)
-                self.write_holding_register(91, -1)  # PDU 91 = va_ref_fixed_pct (-1/0xFFFF = disable)
+                self.write_holding_register(90, -16)  # PDU 90 = va_ref_fixed (0xFFF0 = disable)
+                self.write_holding_register(91, -16)  # PDU 91 = va_ref_fixed_pct (0xFFF0 = disable)
                 # Also disable voltage override
                 self.pending_voltage_override = None
                 self.voltage_override_active = False
@@ -1522,7 +1522,7 @@ class TriStarDriver:
                 client.close()
                 # Log register 90 (Vb_ref_slave) writes at INFO level for visibility
                 if address == 90:
-                    if value == -1 or unsigned_value >= 65535:
+                    if value < 0:
                         logging.info(f"Successfully wrote register {address} = {value} (disable slave mode)")
                     else:
                         logging.info(f"Successfully wrote register {address} = {value} (enable slave mode)")
@@ -2187,7 +2187,7 @@ class TriStarDriver:
                     self.override_start_time = None
                     self.tail_current_start_time = None
                     self.time_above_target_accumulated = 0
-                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
+                    self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
 
                 # Safety check 2: Battery full (tail current)?
                 # Check voltage at target AND (excess power OR disabled) AND low current
@@ -2211,7 +2211,7 @@ class TriStarDriver:
                             self.tail_current_start_time = None
                             self.override_start_time = None
                             self.time_above_target_accumulated = 0
-                            self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
+                            self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
                             ts = datetime.now().isoformat(timespec='seconds')
                             self.dbus['/Custom/VoltageOverride/BalanceComplete'] = True
                             self.dbus['/Custom/VoltageOverride/LastBalanceTimestamp'] = ts
@@ -2462,7 +2462,7 @@ class TriStarDriver:
                     self.pending_voltage_override = None
                     self.voltage_override_active = False
                     self.stop_reason = "NightlyReset"
-                    self.write_holding_register(89, -1)  # PDU 89 = vb_ref_slave (-1/0xFFFF = disable slave mode per Morningstar spec)
+                    self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
 
                 # 2. Reset cumulative time counter (fresh start for new day)
                 if self.time_above_target_accumulated > 0:

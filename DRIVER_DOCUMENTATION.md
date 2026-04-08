@@ -518,7 +518,7 @@ if at_target and i_charge < battery_full_current:
     if tail_duration >= tail_current_time:
         # Battery full!
         stop_reason = "BatteryFull"
-        write_holding_register(89, -1)  # Disable override
+        write_holding_register(89, -16)  # Disable override (0xFFF0)
 else:
     tail_current_start_time = None  # RESET timer to zero!
 ```
@@ -547,7 +547,7 @@ else:
 if time_at_target >= max_voltage_override_time:
     # Time limit reached!
     stop_reason = "TimeLimit"
-    write_holding_register(89, -1)  # Disable override
+    write_holding_register(89, -16)  # Disable override (0xFFF0)
 ```
 
 #### 6. User Disables
@@ -555,7 +555,9 @@ if time_at_target >= max_voltage_override_time:
 Payload: 0   (or any value <= 0)
 ```
 
-Immediately writes -1 (0xFFFF in two's complement) to PDU 89 to disable slave mode.
+Immediately writes `0xFFF0` (-16 signed) to PDU 89 to disable slave mode.
+
+**Note:** The Morningstar Modbus spec says "write a negative value to disable slave control" without specifying which value. `0xFFFF` (-1) and `0x0000` (0) both cause incorrect behavior (state 10 or slave control timeout). The correct value is `0xFFF0` (-16), confirmed by Morningstar technical support.
 
 ### Monitoring
 
