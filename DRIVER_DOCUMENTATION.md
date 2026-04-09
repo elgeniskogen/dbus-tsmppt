@@ -327,8 +327,22 @@ Located at: `venus-home/N/.../solarcharger/0/Control/...`
 ```
 /Control/EqualizeTriggered      WRITEABLE (bool) - Trigger equalize charge
 /Control/ChargerDisconnect      WRITEABLE (bool) - Force disconnect
-/Control/ResetController        WRITEABLE (bool) - Reset TriStar controller
-/Control/ResetCommServer        WRITEABLE (bool) - Reset TriStar comm server
+/Control/ResetCommServer        WRITEABLE (bool) - Reset TriStar comm server (fire-and-forget)
+```
+
+```
+/Control/ResetController        WRITEABLE (bool) - Safe controller reset (async)
+```
+Safe reset procedure (same as after EEPROM writes):
+1. Save state.json — preserves daily counters (reset by controller restart)
+2. DISCONNECT → verify controller is disconnected
+3. Send reset command
+4. Smart reconnect — polls until controller responds
+5. Set daily_register_has_reset=False — driver uses state.json until next sunrise
+
+MQTT command (same path as before):
+```bash
+mosquitto_pub -h <venus-ip> -t "W/<portal-id>/solarcharger/0/Control/ResetController" -m '{"value": 1}'
 ```
 
 ---

@@ -1040,11 +1040,15 @@ class TriStarDriver:
         """Called when a coil control is written via D-Bus"""
         logging.info(f"Coil write request: {path} = {value}")
 
+        # ResetController uses safe procedure (disconnect → save state → reset → reconnect)
+        if path == '/Control/ResetController':
+            threading.Thread(target=self._safe_reset_controller_async, daemon=True).start()
+            return 0
+
         # Map D-Bus path to coil address
         coil_map = {
             '/Control/EqualizeTriggered': COIL_EQUALIZE,
             '/Control/ChargerDisconnect': COIL_DISCONNECT,
-            '/Control/ResetController': COIL_RESET_CTRL,
             '/Control/ResetCommServer': COIL_RESET_COMM,
         }
 
@@ -1057,7 +1061,7 @@ class TriStarDriver:
         success = self.write_coil(coil_addr, bool(value))
 
         # For momentary buttons, reset to 0 immediately
-        if coil_addr in [COIL_RESET_CTRL, COIL_RESET_COMM]:
+        if coil_addr == COIL_RESET_COMM:
             return 0  # Fire-and-forget
 
         # For stateful coils, keep the written value
@@ -2751,6 +2755,60 @@ class TriStarDriver:
                 continue
 
         raise Exception(f"Failed to reconnect to controller after {timeout_sec}s")
+
+    def _safe_reset_controller_async(self):
+        """
+        Safe controller reset procedure:
+        1. Save state.json (daily counters reset on controller restart)
+        2. DISCONNECT → verify
+        3. Reset controller
+        4. Smart reconnect
+        5. Clean up internal state (override, daily register flag)
+        """
+        logging.info("Safe controller reset: starting")
+        self.main_loop_paused = True
+        try:
+            # Step 1: Save state (daily registers will be cleared by reset)
+            self._save_state()
+            logging.info("✓ State saved before controller reset")
+
+            # Step 2: DISCONNECT
+            if not self.write_coil(COIL_DISCONNECT, True):
+                raise Exception("Failed to set DISCONNECT coil")
+            if not self._wait_for_charge_state(2, timeout_sec=5, step_name="DISCONNECT: "):
+                logging.warning("DISCONNECT state not confirmed, continuing anyway...")
+
+            # Step 3: Reset controller
+            reset_result = self.write_coil(COIL_RESET_CTRL, True)
+            if reset_result:
+                logging.info("✓ Controller reset command sent")
+            else:
+                logging.info("Controller reset triggered (connection closed - expected)")
+
+            # Step 4: Smart reconnect
+            self._smart_reconnect(timeout_sec=20)
+            logging.info("✓ Controller reconnected after reset")
+
+            # Step 5: Clean up internal state
+            self.pending_voltage_override = None
+            self.voltage_override_active = False
+            self.override_start_time = None
+            self.tail_current_start_time = None
+            self.time_above_target_accumulated = 0
+            self.dbus['/Custom/VoltageOverride/Active'] = False
+            self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
+            self.dbus['/Custom/VoltageOverride/RegisterReadback'] = 0.0
+
+            # Daily registers are cleared by reset — use state.json until next sunrise
+            self.daily_register_has_reset = False
+            logging.info("✓ daily_register_has_reset=False — using state.json until sunrise")
+
+            logging.info("Safe controller reset: complete")
+
+        except Exception as e:
+            logging.error(f"Safe controller reset failed: {e}")
+        finally:
+            self.main_loop_paused = False
 
     def _apply_charge_profile_async(self, profile_name):
         """
