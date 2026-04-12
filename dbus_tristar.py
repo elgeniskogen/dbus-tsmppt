@@ -566,6 +566,34 @@ class TriStarDriver:
             "last_known_season": ""     # Season at last profile auto-switch check
         }
 
+    def _flush_today_to_state(self):
+        """
+        Flush all current daily values to state['today'] before a controller reset.
+        Uses D-Bus values and in-memory trackers (no Modbus needed).
+        Time-in-state values (absorption/float/equalize) are left as-is from last loop update
+        since they require Modbus registers — the existing offset mechanism handles post-reset continuity.
+        """
+        # Yield: use D-Bus value (most current)
+        current_yield = self.dbus['/History/Daily/0/Yield']
+        if current_yield is not None and current_yield > 0:
+            self.state['today']['yield'] = round(float(current_yield), 3)
+
+        # Max/min trackers (in-memory, updated every poll)
+        self.state['today']['max_battery_current'] = self.daily_max_battery_current
+        self.state['today']['max_power'] = self.daily_max_power
+        self.state['today']['max_pv_voltage'] = self.daily_max_pv_voltage
+        self.state['today']['max_battery_voltage'] = self.daily_max_battery_voltage
+        self.state['today']['min_battery_voltage'] = self.daily_min_battery_voltage
+
+        # Time in bulk (tracked by driver, not Modbus)
+        self.state['today']['time_bulk'] = int(self.t_bulk_ms / (1000 * 60))
+
+        logging.info(
+            f"Pre-reset flush: yield={self.state['today'].get('yield', 0):.3f} kWh, "
+            f"max_power={self.daily_max_power:.0f}W, "
+            f"time_bulk={self.state['today']['time_bulk']}min"
+        )
+
     def _save_state(self):
         """Save state to JSON file atomically"""
         try:
@@ -1042,8 +1070,9 @@ class TriStarDriver:
 
         # ResetController uses safe procedure (disconnect → save state → reset → reconnect)
         if path == '/Control/ResetController':
-            threading.Thread(target=self._safe_reset_controller_async, daemon=True).start()
-            return 0
+            if value:
+                threading.Thread(target=self._safe_reset_controller_async, daemon=True).start()
+            return 0  # Always reset to 0 so next write triggers callback
 
         # Map D-Bus path to coil address
         coil_map = {
@@ -2013,8 +2042,16 @@ class TriStarDriver:
 
             # Calculate daily yield with offset (for controller resets before midnight)
             if not self.daily_register_has_reset:
-                daily_kwh = 0.0  # Don't use yesterday's stale value
-                logging.debug("Post-midnight, pre-sunrise: using 0 for daily yield")
+                # Two cases: post-midnight (stale yesterday value) OR controller reset midt på dagen
+                # Distinguish by checking if state.json has today's date
+                current_date = self._get_local_date()
+                if self.state.get('current_date', '') == current_date:
+                    # Controller reset mid-day: use state.json yield (flushed before reset)
+                    daily_kwh = self.state['today'].get('yield', 0.0)
+                    logging.debug(f"Post-reset, pre-sunrise: using state.json yield {daily_kwh:.3f} kWh")
+                else:
+                    daily_kwh = 0.0  # Post-midnight, pre-sunrise: don't use yesterday's stale value
+                    logging.debug("Post-midnight, pre-sunrise: using 0 for daily yield")
             else:
                 # Apply offset (normally 0, but set when controller reset happens)
                 modbus_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0
@@ -2038,7 +2075,11 @@ class TriStarDriver:
             # We must recalculate to match current flag state, otherwise spike occurs
             old_daily_kwh = daily_kwh  # Save for logging
             if not self.daily_register_has_reset:
-                daily_kwh = 0.0  # Post-midnight pre-sunrise: use 0
+                current_date = self._get_local_date()
+                if self.state.get('current_date', '') == current_date:
+                    daily_kwh = self.state['today'].get('yield', 0.0)  # Controller reset mid-day
+                else:
+                    daily_kwh = 0.0  # Post-midnight pre-sunrise: use 0
             else:
                 modbus_kwh = (self.daily_wh_offset + current_daily_wh) / 1000.0
                 daily_kwh = max(self.state['today'].get('yield', 0.0), modbus_kwh)
@@ -2768,9 +2809,17 @@ class TriStarDriver:
         logging.info("Safe controller reset: starting")
         self.main_loop_paused = True
         try:
-            # Step 1: Save state (daily registers will be cleared by reset)
+            # Step 1: Flush today's values and save state (daily registers reset on controller restart)
+            self._flush_today_to_state()
             self._save_state()
             logging.info("✓ State saved before controller reset")
+
+            # Create dedicated Modbus client (same pattern as profile apply)
+            ip = self.settings['ip_address']
+            port = self.settings['modbus_port']
+            self.client = ModbusTcpClient(host=ip, port=port, timeout=2, retries=0)
+            if not self.client.connect():
+                raise Exception("Failed to connect to controller")
 
             # Step 2: DISCONNECT
             if not self.write_coil(COIL_DISCONNECT, True):
@@ -2889,7 +2938,8 @@ class TriStarDriver:
             self._update_profile_status("writing", 60, "Verifying writes...")
             self._verify_eeprom_writes(changes)
 
-            # Step 8.5: Save state before controller reset (preserve daily statistics)
+            # Step 8.5: Flush today's values and save state (daily registers reset on controller restart)
+            self._flush_today_to_state()
             self._save_state()
             logging.info("✓ State saved before controller reset")
 
