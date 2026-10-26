@@ -573,6 +573,8 @@ Immediately writes `0xFFF0` (-16 signed) to PDU 89 to disable slave mode.
 
 **Note:** The Morningstar Modbus spec says "write a negative value to disable slave control" without specifying which value. `0xFFFF` (-1) and `0x0000` (0) both cause incorrect behavior (state 10 or slave control timeout). The correct value is `0xFFF0` (-16), confirmed by Morningstar technical support.
 
+**WARNING - PDU 90/91 are different:** `0xFFF0` is ONLY correct for PDU 89 (and 88). PDU 90 (`va_ref_fixed`) and PDU 91 (`va_ref_fixed_pct`) must be written `0` to keep MPPT on. Per spec, ANY non-zero value stops MPPT. A negative value pins the array at battery voltage (observed: array 28.6 V instead of Vmp 92 V, ~1/3 power, charge_state 10). The value stays in RAM until controller reset. Since v2.37 the driver writes 0 on override disable, and auto-clears any non-zero value it finds during polling.
+
 ### Monitoring
 
 **Active status:**
@@ -1182,8 +1184,8 @@ REG_FLAGS = 91                 # Alarm/fault flags
 ```
 PDU 88 = Ib_ref_slave          # Current override (slave mode)
 PDU 89 = vb_ref_slave          # Voltage override (slave mode) ← PRIMARY
-PDU 90 = va_ref_fixed          # Array voltage fixed (disables MPPT)
-PDU 91 = va_ref_fixed_pct      # Array voltage fixed percent
+PDU 90 = va_ref_fixed          # Array voltage fixed (disables MPPT if != 0, MUST be 0)
+PDU 91 = va_ref_fixed_pct      # Array voltage fixed percent (disables MPPT if != 0, MUST be 0)
 ```
 
 **Note:** PDU address = Logical address - 1

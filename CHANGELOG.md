@@ -2,6 +2,15 @@
 
 All notable changes to the TriStar MPPT driver for Venus OS.
 
+## [2.37] - 2026-10-26
+
+### Fixed - MPPT disabled after turning override off
+- Disabling voltage/current override wrote `0xFFF0` to PDU 90 (`va_ref_fixed`) and PDU 91 (`va_ref_fixed_pct`). Per spec any non-zero value stops MPPT; the negative target pinned the array at battery voltage (28.6 V instead of Vmp ~92 V), limiting output to ~1/3 (≈300 W instead of ≈890 W) and putting the controller in undocumented charge_state 10. It persisted in RAM until controller reset, so it also crippled later override sessions.
+- Now writes `0` to PDU 90/91. `0xFFF0` is still used for PDU 88/89 (correct per Morningstar).
+- Polling now warns on, and clears, any non-zero value in PDU 90/91 (previously negative values were hidden).
+- `VaRefFixedPct` scaling corrected to n·100·2^-16 (spec).
+- charge_state 10 shown as `FIXED_ARRAY_V` (mapped to Bulk) instead of unknown/off.
+
 ## [2.26] - 2026-03-26
 
 ### Added - Charge Profile Management & EEPROM Programming

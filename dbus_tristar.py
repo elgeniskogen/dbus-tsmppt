@@ -33,7 +33,7 @@ sys.path.insert(1, '/opt/victronenergy/dbus-systemcalc-py/ext/velib_python')
 from vedbus import VeDbusService
 from settingsdevice import SettingsDevice
 
-VERSION = "2.36"  # Feat: HA integration — 16 seasonal profiles, PlannedVisitSOC, balance tracking
+VERSION = "2.37"  # Fix: write 0 (not 0xFFF0) to PDU 90/91 - non-zero disabled MPPT; auto-clear if found
 PRODUCT_ID = 0xABCD  # Placeholder - can be registered with Victron
 
 # ============================================================================
@@ -183,7 +183,9 @@ CHARGE_STATE_MAP = {
     6: 4,   # ABSORPTION -> ABSORPTION
     7: 5,   # FLOAT -> FLOAT
     8: 7,   # EQUALIZE -> EQUALIZE
-    9: 4    # SLAVE -> ABSORPTION (actively regulating to target voltage)
+    9: 4,   # SLAVE -> ABSORPTION (actively regulating to target voltage)
+    10: 3   # FIXED (undocumented) -> BULK. Seen when va_ref_fixed (PDU 90/91) is non-zero:
+            # MPPT stopped, array held at fixed voltage. Still charging, but at reduced power.
 }
 
 # TriStar charge state text (raw TriStar values)
@@ -197,7 +199,8 @@ CHARGE_STATE_TEXT = {
     6: "ABSORPTION",
     7: "FLOAT",
     8: "EQUALIZE",
-    9: "SLAVE"
+    9: "SLAVE",
+    10: "FIXED_ARRAY_V"  # Undocumented; observed with va_ref_fixed != 0 (MPPT disabled)
 }
 
 # Fault bitfield definitions (REG_FAULTS = 44, REG_FAULTS_DAILY = 73)
@@ -1114,9 +1117,10 @@ class TriStarDriver:
                 logging.info("Voltage override disabled by user")
                 # Immediately write -1 to disable slave mode
                 self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
-                # Also clear array voltage registers to ensure MPPT is enabled
-                self.write_holding_register(90, -16)  # PDU 90 = va_ref_fixed (0xFFF0 = disable)
-                self.write_holding_register(91, -16)  # PDU 91 = va_ref_fixed_pct (0xFFF0 = disable)
+                # Also clear array voltage registers to ensure MPPT is enabled.
+                # Must be 0: ANY non-zero value (incl. 0xFFF0) stops MPPT and pins the array voltage.
+                self.write_holding_register(90, 0)  # PDU 90 = va_ref_fixed (0 = MPPT on)
+                self.write_holding_register(91, 0)  # PDU 91 = va_ref_fixed_pct (0 = MPPT on)
                 # Update D-Bus paths immediately to show disabled
                 self.dbus['/Custom/VoltageOverride/CurrentVoltage'] = 0.0
                 self.dbus['/Custom/VoltageOverride/Active'] = False
@@ -1187,9 +1191,10 @@ class TriStarDriver:
                 # (TriStar requires both registers to be maintained together)
                 self.write_holding_register(88, -16)  # PDU 88 = Ib_ref_slave (0xFFF0 = disable slave mode)
                 self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
-                # Also clear array voltage registers to ensure MPPT is enabled
-                self.write_holding_register(90, -16)  # PDU 90 = va_ref_fixed (0xFFF0 = disable)
-                self.write_holding_register(91, -16)  # PDU 91 = va_ref_fixed_pct (0xFFF0 = disable)
+                # Also clear array voltage registers to ensure MPPT is enabled.
+                # Must be 0: ANY non-zero value (incl. 0xFFF0) stops MPPT and pins the array voltage.
+                self.write_holding_register(90, 0)  # PDU 90 = va_ref_fixed (0 = MPPT on)
+                self.write_holding_register(91, 0)  # PDU 91 = va_ref_fixed_pct (0 = MPPT on)
                 # Also disable voltage override
                 self.pending_voltage_override = None
                 self.voltage_override_active = False
@@ -1512,7 +1517,7 @@ class TriStarDriver:
         Write single holding register with retry logic
 
         Args:
-            address: Register address (e.g., 90 for Vb_ref_slave)
+            address: PDU register address (e.g., 89 for vb_ref_slave)
             value: 16-bit signed integer value (-32768 to 32767)
 
         Returns:
@@ -2346,29 +2351,22 @@ class TriStarDriver:
             # END CURRENT OVERRIDE CONTROL LOGIC
             # ========================================================================
 
-            # Read manual control registers that might interfere with slave mode
-            # These should normally be 0 unless explicitly set
-            va_ref_fixed_regs = self.read_holding_registers(90, 2)  # Read PDU 90-91 (va_ref_fixed, va_ref_fixed_pct)
+            # Read array voltage fix registers (PDU 90-91). ANY non-zero value - including
+            # negative values like 0xFFF0 - stops MPPT and pins the array voltage (charge_state 10).
+            # A negative target pins the array at battery voltage (~1/3 power on a 24V system).
+            # This driver never uses fixed array mode, so non-zero is always an error: clear it.
+            va_ref_fixed_regs = self.read_holding_registers(90, 2)  # PDU 90 = va_ref_fixed, 91 = va_ref_fixed_pct
             if va_ref_fixed_regs is not None:
-                # Register 91 (0x005A): Va_ref_fixed - Array voltage fixed target
                 va_ref_fixed_raw = self._to_signed(va_ref_fixed_regs[0])
-                if va_ref_fixed_raw > 0:
-                    va_ref_fixed = va_ref_fixed_raw * self.v_pu / 32768.0
-                    self.dbus['/Custom/ManualControl/VaRefFixed'] = round(va_ref_fixed, 2)
-                    if va_ref_fixed > 1.0:  # Only warn if significantly non-zero
-                        logging.warning(f"Va_ref_fixed is set to {va_ref_fixed:.2f}V - this disables MPPT sweeping!")
-                else:
-                    self.dbus['/Custom/ManualControl/VaRefFixed'] = 0.0
-
-                # Register 92 (0x005B): Va_ref_fixed_pct - Array voltage % of Voc
                 va_ref_fixed_pct_raw = self._to_signed(va_ref_fixed_regs[1])
-                if va_ref_fixed_pct_raw > 0:
-                    va_ref_fixed_pct = va_ref_fixed_pct_raw * 100.0 / 32768.0
-                    self.dbus['/Custom/ManualControl/VaRefFixedPct'] = round(va_ref_fixed_pct, 1)
-                    if va_ref_fixed_pct > 1.0:  # Only warn if significantly non-zero
-                        logging.warning(f"Va_ref_fixed_pct is set to {va_ref_fixed_pct:.1f}% - this disables MPPT sweeping!")
-                else:
-                    self.dbus['/Custom/ManualControl/VaRefFixedPct'] = 0
+                self.dbus['/Custom/ManualControl/VaRefFixed'] = round(va_ref_fixed_raw * self.v_pu / 32768.0, 2)
+                self.dbus['/Custom/ManualControl/VaRefFixedPct'] = round(va_ref_fixed_pct_raw * 100.0 / 65536.0, 1)  # n·100·2^-16
+
+                for pdu, raw in ((90, va_ref_fixed_raw), (91, va_ref_fixed_pct_raw)):
+                    if raw != 0:
+                        logging.warning(f"PDU {pdu} (va_ref_fixed{'_pct' if pdu == 91 else ''}) = {raw} "
+                                        f"(0x{raw & 0xFFFF:04X}) - MPPT disabled! Writing 0 to restore MPPT")
+                        self.write_holding_register(pdu, 0)
 
             # Total yield (use persistent counter to avoid double-counting)
             # Do NOT auto-initialize from TriStar registers (they may be reset or have wrong baseline)
