@@ -11,6 +11,12 @@ All notable changes to the TriStar MPPT driver for Venus OS.
 - `VaRefFixedPct` scaling corrected to n·100·2^-16 (spec).
 - charge_state 10 shown as `FIXED_ARRAY_V` (mapped to Bulk) instead of unknown/off.
 
+### Fixed - Timezone leak
+- `_get_local_datetime()` set `TZ` without restoring it, so from startup (season check) the whole process ran in local time. Log timestamps switched from UTC to local mid-log.
+- New `_local_now()` helper: sets TZ under a lock and always restores it (`finally`). Used by local date (midnight rollover), nightly reset/season check (02:30/03:00 local) and season detection - same results as before.
+- User-facing timestamps (LastBalanceTimestamp, ChargeProfile/LastApplied, EEPROM backup names) now explicitly local - unchanged from what users saw before.
+- Python log timestamps forced to UTC, matching multilog/tai64 and Venus system time.
+
 ## [2.26] - 2026-03-26
 
 ### Added - Charge Profile Management & EEPROM Programming

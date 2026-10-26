@@ -22,6 +22,9 @@ import json
 from pathlib import Path
 import threading
 
+# Guards temporary TZ changes in _local_now() (process-global env var; profile apply runs in threads)
+_TZ_LOCK = threading.Lock()
+
 # pymodbus v2.x (Venus OS) vs v3.x compatibility
 try:
     from pymodbus.client import ModbusTcpClient
@@ -617,31 +620,36 @@ class TriStarDriver:
         except Exception as e:
             logging.error(f"Error saving state: {e}")
 
+    def _local_now(self):
+        """
+        Current local time (naive datetime) per Venus /Settings/System/TimeZone.
+
+        Venus OS runs in UTC; the TimeZone setting is GUI-only. We temporarily set TZ,
+        read the clock, and ALWAYS restore TZ (finally), so the rest of the process
+        (incl. logging) stays in UTC. Lock guards against concurrent threads.
+        Raises on D-Bus errors - callers decide the fallback.
+        """
+        bus = dbus.SystemBus()
+        settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
+        tz_string = str(settings.GetValue())
+
+        with _TZ_LOCK:
+            old_tz = os.environ.get('TZ')
+            try:
+                os.environ['TZ'] = tz_string
+                time_module.tzset()
+                return datetime.now()
+            finally:
+                if old_tz is not None:
+                    os.environ['TZ'] = old_tz
+                else:
+                    os.environ.pop('TZ', None)
+                time_module.tzset()
+
     def _get_local_date(self):
         """Get current date in local timezone from D-Bus timezone setting"""
         try:
-            # Read timezone from Venus OS D-Bus settings (e.g., 'Europe/Paris')
-            bus = dbus.SystemBus()
-            settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
-            tz_string = settings.GetValue()
-
-            # Temporarily set TZ environment variable to get correct local time
-            old_tz = os.environ.get('TZ', '')
-            os.environ['TZ'] = tz_string
-            time_module.tzset()
-
-            # Get local date in the configured timezone
-            local_date = time_module.strftime('%Y-%m-%d', time_module.localtime())
-
-            # Restore original TZ setting
-            if old_tz:
-                os.environ['TZ'] = old_tz
-            else:
-                if 'TZ' in os.environ:
-                    del os.environ['TZ']
-            time_module.tzset()
-
-            return local_date
+            return self._local_now().date().isoformat()
 
         except Exception as e:
             logging.error(f"Error getting local date from timezone: {e}")
@@ -2262,7 +2270,7 @@ class TriStarDriver:
                             self.override_start_time = None
                             self.time_above_target_accumulated = 0
                             self.write_holding_register(89, -16)  # PDU 89 = vb_ref_slave (0xFFF0 = disable slave mode, per Morningstar support)
-                            ts = datetime.now().isoformat(timespec='seconds')
+                            ts = self._get_local_datetime().isoformat(timespec='seconds')
                             self.dbus['/Custom/VoltageOverride/BalanceComplete'] = True
                             self.dbus['/Custom/VoltageOverride/LastBalanceTimestamp'] = ts
                             self.state['voltage_override']['last_balance_timestamp'] = ts
@@ -2438,24 +2446,9 @@ class TriStarDriver:
 
         # Get current local hour/minute
         try:
-            bus = dbus.SystemBus()
-            settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
-            tz_string = settings.GetValue()
-
-            old_tz = os.environ.get('TZ', '')
-            os.environ['TZ'] = tz_string
-            time_module.tzset()
-
-            current_hour = int(time_module.strftime('%H', time_module.localtime()))
-            current_minute = int(time_module.strftime('%M', time_module.localtime()))
-
-            # Restore TZ
-            if old_tz:
-                os.environ['TZ'] = old_tz
-            else:
-                if 'TZ' in os.environ:
-                    del os.environ['TZ']
-            time_module.tzset()
+            local_now = self._local_now()
+            current_hour = local_now.hour
+            current_minute = local_now.minute
 
         except Exception as e:
             logging.error(f"Error getting local time for nightly reset: {e}")
@@ -2897,7 +2890,7 @@ class TriStarDriver:
             if not changes:
                 logging.info(f"Profile '{profile_name}' already matches EEPROM, no changes needed")
                 self._update_profile_status("success", 100, "success (no changes needed)")
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                timestamp = self._get_local_datetime().strftime("%Y-%m-%d %H:%M:%S")
                 self.dbus['/Custom/ChargeProfile/LastApplied'] = f"{profile_name} (no changes) at {timestamp}"
                 self._save_charge_profiles()
                 return
@@ -2982,7 +2975,7 @@ class TriStarDriver:
 
             # Step 13: Success!
             self._update_profile_status("success", 100, "success")
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = self._get_local_datetime().strftime("%Y-%m-%d %H:%M:%S")
             self.dbus['/Custom/ChargeProfile/LastApplied'] = f"{profile_name} at {timestamp}"
 
             # Update profiles JSON
@@ -3189,11 +3182,11 @@ class TriStarDriver:
         backup_dir = Path("/data/dbus-tristar/eeprom_backups")
         backup_dir.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = self._get_local_datetime().strftime("%Y%m%d_%H%M%S")
         backup_file = backup_dir / f"backup_{timestamp}.json"
 
         backup_data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": self._get_local_datetime().isoformat(),
             "reason": reason,
             "values": eeprom_values
         }
@@ -3298,17 +3291,12 @@ class TriStarDriver:
             return 'summer'  # Safe fallback
 
     def _get_local_datetime(self):
-        """Get current local datetime (reuses timezone logic from _get_local_date)"""
-        from datetime import datetime as _datetime
+        """Get current local datetime; falls back to UTC if the TimeZone setting can't be read"""
         try:
-            bus = dbus.SystemBus()
-            settings = bus.get_object('com.victronenergy.settings', '/Settings/System/TimeZone')
-            tz_string = settings.GetValue()
-            os.environ['TZ'] = tz_string
-            time_module.tzset()
-        except Exception:
-            pass
-        return _datetime.now()
+            return self._local_now()
+        except Exception as e:
+            logging.error(f"Error getting local time from timezone: {e}")
+            return datetime.now()
 
     def _apply_rest_profile_for_season(self, season=None):
         """
@@ -3383,6 +3371,8 @@ def main():
         level=logging.INFO,
         format='%(asctime)s %(levelname)-8s %(message)s'
     )
+    # Log timestamps always in UTC, matching multilog/tai64 and Venus system time
+    logging.Formatter.converter = time_module.gmtime
 
     logging.info(f"dbus-tristar v{VERSION} starting")
     logging.info("Venus OS compatible using SettingsDevice")
